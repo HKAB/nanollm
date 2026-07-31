@@ -1,7 +1,7 @@
 """
 Train model. From root directory of the project, run as:
 
-python -m scripts.base_train --pretrained-model-path ./Qwen3.5-0.8B --dataset-path /path/to/dataset --run my_run_name
+python -m scripts.base_train --pretrained-model-path /path/to/model --dataset-root /path/to/dataset --run my_run_name
 
 or distributed as:
 
@@ -9,34 +9,57 @@ torchrun --nproc_per_node=8 -m scripts.base_train
 """
 
 import os
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 # Persistent torch.compile cache — avoids recompiling on every restart
-os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "nanoqwen35", "inductor"))
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "nanollm", "inductor"))
+import argparse
 import gc
 import json
-import time
 import math
-import argparse
+import time
 from contextlib import contextmanager
 
-import wandb
 import torch
-import torch.distributed as dist
+import torch.nn as nn
 import torch._inductor.config as inductor_config
+import torch.distributed as dist
+import wandb
+
+from nanollm.fp8 import Float8LinearConfig, convert_to_float8_training
+
 inductor_config.fx_graph_cache = True  # persist compiled FX graphs to disk
 
-from nanoqwen35.qwen import Linear
-from nanoqwen35.dataloader import (
-    pretrain_loader_with_state,
-    pretrain_loader,
+from nanollm.checkpoint_manager import (
+    load_checkpoint,
+    load_pretrained_hf,
+    save_checkpoint,
 )
-from nanoqwen35.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanoqwen35.tokenizer import get_tokenizer
-from nanoqwen35.checkpoint_manager import save_checkpoint, load_checkpoint, load_pretrained_hf
-from nanoqwen35.loss_eval import evaluate_loss
-from nanoqwen35.engine import Engine
-from nanoqwen35.flash_attention import HAS_FA3
+from nanollm.common import (
+    COMPUTE_DTYPE,
+    COMPUTE_DTYPE_REASON,
+    DummyWandb,
+    autodetect_device_type,
+    compute_cleanup,
+    compute_init,
+    get_base_dir,
+    get_peak_flops,
+    is_ddp_initialized,
+    print0,
+    print_banner,
+)
+from nanollm.dataloader import (
+    pretrain_loader,
+    pretrain_loader_with_state,
+)
+from nanollm.engine import Engine
+from nanollm.report import get_report
+from nanollm.flash_attention import HAS_FA3
+from nanollm.loss_eval import evaluate_loss
+from nanollm.models.qwen import Linear
+from nanollm.tokenizer import get_tokenizer
 from scripts.base_eval import evaluate_core
+
 print_banner()
 
 # -----------------------------------------------------------------------------
@@ -44,7 +67,7 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
-parser.add_argument("--wandb-project", type=str, default="nanoqwen35", help="wandb project name")
+parser.add_argument("--wandb-project", type=str, default="nanollm", help="wandb project name")
 parser.add_argument("--wandb-entity", type=str, default=None, help="wandb entity/team name (leave blank for personal account)")
 parser.add_argument("--wandb-id", type=str, default=None, help="wandb run ID — pass the previous run ID with --resume-from-step to continue the same dashboard run")
 parser.add_argument("--wandb-tags", type=str, default=None, help="comma-separated tags, e.g. '0.8B,pretrain,fp8'")
@@ -88,7 +111,7 @@ parser.add_argument("--model-tag", type=str, default=None, help="override model 
 parser.add_argument(
     "--pretrained-model-path",
     type=str,
-    default="./Qwen3.5-0.8B",
+    required=True,
     help="path or HF repo id of pretrained model/tokenizer",
 )
 parser.add_argument("--dataset-root", type=str, required=True, help="root of merged flat shards (output of pretokenize_and_merge.py)")
@@ -131,7 +154,8 @@ else:
     wandb.define_metric("*", step_metric="step")
 
 # Flash Attention status
-from nanoqwen35.flash_attention import USE_FA3
+from nanollm.flash_attention import USE_FA3
+
 using_fa3 = USE_FA3
 if using_fa3:
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
@@ -147,7 +171,7 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer("Qwen/Qwen3.5-0.8B-Base")
+tokenizer = get_tokenizer(args.pretrained_model_path)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
@@ -189,11 +213,6 @@ if args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanoqwen35.fp8 import Float8LinearConfig, convert_to_float8_training
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-        import torch.nn as nn
-
         # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
         def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
             if not isinstance(mod, nn.Linear):
@@ -219,7 +238,6 @@ def disable_fp8(model):
     CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
     we swap out Float8Linear modules entirely and restore them after.
     """
-    import torch.nn as nn
 
     # Find all Float8Linear modules and their locations
     fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
@@ -597,7 +615,6 @@ if val_loss is not None:
     print0(f"Minimum validation loss: {min_val_loss:.6f}")
 
 # Log to report
-from nanoqwen35.report import get_report
 get_report().log(section="Base model training", data=[
     user_config, # CLI args
     { # stats about the training setup

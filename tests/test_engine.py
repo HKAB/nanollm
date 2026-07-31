@@ -5,18 +5,20 @@ Run with:
     python -m pytest tests/test_engine.py -v
 """
 
-import torch
 from collections import deque
 from dataclasses import dataclass
-from nanoqwen35.engine import KVCache, Engine, parse_tool_call, dispatch_tool
+import re
 
+import torch
+
+from nanollm.engine import Engine, KVCache, dispatch_tool, parse_tool_call
 
 # -----------------------------------------------------------------------------
 # Shared mock infrastructure
 
-IM_END_ID  = 151645   # <|im_end|> in Qwen3.5 vocab (used as sentinel in mocks)
+IM_END_ID  = 151645   # used as sentinel in mocks
 EOS_ID     = 151643   # <|endoftext|>
-VOCAB_SIZE = 152064   # Qwen3.5 vocab size (doesn't matter for logic, just needs to be large enough)
+VOCAB_SIZE = 152064   # vocab size (doesn't matter for logic, just needs to be large enough)
 
 
 @dataclass
@@ -30,7 +32,7 @@ class MockConfig:
 
 class MockTokenizer:
     """
-    UTF-8 byte-level tokenizer with Qwen3.5 special tokens.
+    UTF-8 byte-level tokenizer with special tokens.
 
     Token IDs:
       0-255  : raw UTF-8 bytes
@@ -50,20 +52,41 @@ class MockTokenizer:
     def token_to_id(self, s):
         return self._SPECIAL.get(s)
 
+    def decode(self, tokens, **kwargs):
+        if not isinstance(tokens, list):
+            tokens = tokens.tolist()
+        res = bytearray()
+        for t in tokens:
+            if 0 <= t < 256:
+                res.append(t)
+            elif t == IM_END_ID:
+                res.extend(b"<|im_end|>")
+            elif t == EOS_ID:
+                res.extend(b"<|endoftext|>")
+        return res.decode("utf-8", errors="replace")
+
+    def get_eos_token_ids(self):
+        return {IM_END_ID, EOS_ID}
+
+    def parse_tool_call(self, text):
+        m = re.search(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL)
+        if not m:
+            return None
+        content = m.group(1)
+        fn_m = re.search(r'<function=(\w+)', content)
+        if not fn_m:
+            return None
+        func_name = fn_m.group(1)
+        kwargs = {}
+        for pm in re.finditer(r'<parameter=(\w+)>(.*?)</parameter>', content, re.DOTALL):
+            kwargs[pm.group(1)] = pm.group(2).strip()
+        return func_name, kwargs
+
+    def render_tool_response(self, result):
+        return f"\n<tool_response>\n{result}\n</tool_response>\n"
+
     def encode(self, text):
         return list(text.encode("utf-8"))
-
-    def decode(self, token_ids):
-        chunks = []
-        for t in token_ids:
-            if t in self._ID_TO_SPECIAL:
-                chunks.append(self._ID_TO_SPECIAL[t])
-            elif 0 <= t <= 255:
-                try:
-                    chunks.append(bytes([t]).decode("utf-8"))
-                except UnicodeDecodeError:
-                    chunks.append("?")
-        return "".join(chunks)
 
 
 class UniformModel:

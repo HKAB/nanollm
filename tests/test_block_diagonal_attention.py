@@ -12,8 +12,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import nanoqwen35.flash_attention as fa
-from nanoqwen35.qwen import Qwen3_5Model, Qwen3_5ModelConfig, HAS_FLA
+from nanollm.models.qwen import Qwen3_5Model, Qwen3_5ModelConfig, HAS_FLA
+import nanollm.flash_attention as fa
+from nanollm.flash_attention import flash_attn_varlen_func
 
 
 @pytest.fixture(autouse=True)
@@ -42,7 +43,6 @@ def _pack(tokens, segs, device):
 
 class TestVarlenSDPAFallback:
     def test_matches_per_segment_causal(self):
-        from nanoqwen35.flash_attention import flash_attn_varlen_func
         torch.manual_seed(0)
         segs = [3, 2]
         total, H, D = sum(segs), 2, 4

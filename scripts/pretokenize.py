@@ -1,14 +1,19 @@
-import os
-import glob
-import bisect
-import sqlite3
-import logging
 import argparse
+import bisect
+import concurrent.futures
+import glob
+import logging
+import os
+import orjson
+import sqlite3
+import shutil
+import subprocess
+
 import pyarrow as pa
 import pyarrow.parquet as pq
-import concurrent.futures
-from transformers import AutoTokenizer
+from nanollm.tokenizer import get_tokenizer
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +115,7 @@ def bfd_pack(items, L, pad_id):
 
     bins = []          # each: {"ids": [...], "mask": [...], "segs": [...], "rem": int}
     rem_keys = []      # remaining capacities of open bins, kept sorted (parallel to rem_bins)
-    rem_bins = []      # bin indices, parallel to rem_keys
+    rem_bins = []      # bin indices, parallel to rem_bins
 
     for ids, mask in items:
         s = len(ids)
@@ -203,14 +208,7 @@ def parse_args():
         help="Number of blocks buffered before flushing a parquet file (default: 20000).",
     )
     parser.add_argument(
-        "--ignore", nargs="*", default=[
-            "vi-finewiki-082025",
-            "vi-wiki",
-            "history_dedup_fixed_ocr",
-            "history",
-            "multilingual",
-            "safety",
-        ],
+        "--ignore", nargs="*", default=[],
         help="Substrings; files whose path contains any of them are skipped.",
     )
     parser.add_argument(
@@ -264,7 +262,6 @@ def update_chunk_status(db_path, chunk_id, status):
 def process_chunk(chunk_id, filename, start_byte, end_byte,
                   tokenizer_id, output_dir, chunk_size, write_threshold):
     try:
-        import orjson
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, use_fast=True)
         eos_id = tokenizer.eos_token_id
 
@@ -325,8 +322,6 @@ def process_chunk_sft(chunk_id, filename, start_byte, end_byte,
     (under-filled) bin of each buffer is simply padded. Returns per-worker stats.
     """
     try:
-        import orjson
-        from nanoqwen35.tokenizer import get_tokenizer
         tokenizer = get_tokenizer(tokenizer_id)
         pad_id = tokenizer.get_bos_token_id()
         # Generous per-conversation cap; smart_chunk handles anything longer.
@@ -443,10 +438,10 @@ def run_sft(args, db_path, all_filename):
                     update_chunk_status(db_path, chunk_id, "ERROR")
 
     # Dataset metadata so the loader/trainer can validate seq_len and find the pad id.
-    import orjson
     pad_id = get_tokenizer_sft(args).get_bos_token_id()
     meta = {"mode": "sft", "seq_len": args.seq_len, "pad_id": pad_id}
     meta_path = os.path.join(args.output_dir, "pretokenize_metadata.json")
+    print(f"Writing metadata to {meta_path}")
     with open(meta_path, "wb") as f:
         f.write(orjson.dumps(meta, option=orjson.OPT_INDENT_2))
 
@@ -458,7 +453,6 @@ def run_sft(args, db_path, all_filename):
 
 def get_tokenizer_sft(args):
     """Load the project tokenizer wrapper used for SFT rendering."""
-    from nanoqwen35.tokenizer import get_tokenizer
     return get_tokenizer(args.tokenizer)
 
 

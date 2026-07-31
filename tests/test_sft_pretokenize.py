@@ -8,10 +8,11 @@ anywhere. The render-based tests require the Qwen3.5 tokenizer; they are skipped
 it cannot be loaded (set QWEN_TOKENIZER to a local tokenizer dir to enable them).
 """
 import os
+
 import pytest
+from nanollm.tokenizer import Tokenizer, get_tokenizer
 
 import scripts.pretokenize as pt
-
 
 # -----------------------------------------------------------------------------
 # Tokenizer fixture (skips cleanly if unavailable)
@@ -23,10 +24,9 @@ _TOKENIZER_CANDIDATES = [
 
 
 def _load_tokenizer():
-    from nanoqwen35.tokenizer import HuggingFaceTokenizer, get_tokenizer
     for cand in _TOKENIZER_CANDIDATES:
         if cand and os.path.isfile(os.path.join(cand, "tokenizer.json")):
-            return HuggingFaceTokenizer.from_directory(cand)
+            return Tokenizer.from_directory(cand)
     try:
         return get_tokenizer("Qwen/Qwen3.5-0.8B-Base")
     except Exception:

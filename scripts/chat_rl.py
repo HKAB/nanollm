@@ -16,18 +16,33 @@ python -m scripts.chat_rl
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import os
-os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "nanoqwen35", "inductor"))
+
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "nanollm", "inductor"))
 import itertools
-import wandb
+
 import torch
 import torch._inductor.config as inductor_config
+import wandb
+
 inductor_config.fx_graph_cache = True
 import torch.distributed as dist
-from nanoqwen35.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
-from nanoqwen35.checkpoint_manager import save_checkpoint, load_model
-from nanoqwen35.engine import Engine
+
+from nanollm.checkpoint_manager import load_model, save_checkpoint
+from nanollm.common import (
+    DummyWandb,
+    autodetect_device_type,
+    compute_cleanup,
+    compute_init,
+    get_base_dir,
+    print0,
+)
+from nanollm.engine import Engine
 from tasks.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
@@ -71,7 +86,7 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanoqwen35-rl", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanollm-rl", name=args.run, config=user_config)
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
@@ -325,7 +340,8 @@ for step in range(num_steps):
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
 # Log to report
-from nanoqwen35.report import get_report
+from nanollm.report import get_report
+
 get_report().log(section="Chat RL", data=[
     user_config, # CLI args
 ])

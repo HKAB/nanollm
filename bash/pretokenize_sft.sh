@@ -8,11 +8,11 @@
 #
 # IMPORTANT: train with --max-seq-len equal to (SEQ_LEN - 1) and --pretokenized.
 
-INPUT_DIR=/mnt/data/users/truongnp5/sft_data/**/*.jsonl
-OUTPUT_DIR=/mnt/data/users/truongnp5/sft_data_pretokenized/
+INPUT_DIR=/mnt/data/users/truongnp5/final_clean_data/final_sft/eng_zn_processed/*.jsonl
+OUTPUT_DIR=/mnt/data/users/truongnp5/final_clean_data/final_sft_pretokenized/
 TOKENIZER=Qwen/Qwen3.5-0.8B-Base
 HF_HOME=/mnt/data/users/truongnp5/cache/huggingface
-SEQ_LEN=2049   # train --max-seq-len must be 2048
+SEQ_LEN=4097   # train --max-seq-len must be 2048
 
 python -m scripts.pretokenize \
     --mode            sft \

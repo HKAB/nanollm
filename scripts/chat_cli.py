@@ -5,10 +5,10 @@ Intended to be run single GPU only atm:
 python -m scripts.chat_cli
 """
 import argparse
-import torch
-from nanoqwen35.common import compute_init, autodetect_device_type
-from nanoqwen35.engine import Engine
-from nanoqwen35.checkpoint_manager import load_model
+
+from nanollm.checkpoint_manager import load_model
+from nanollm.common import autodetect_device_type, compute_init
+from nanollm.engine import Engine
 
 parser = argparse.ArgumentParser(description='Chat with the model')
 parser.add_argument('-i', '--source', type=str, default="pretrained", help="Source of the model: sft|rl|pretrained")

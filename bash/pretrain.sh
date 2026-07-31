@@ -2,11 +2,11 @@
 # Pipeline: raw jsonl → pretokenize.sh → this script.
 
 export WANDB_MODE=offline
-export NANOQWEN_BASE_DIR=/mnt/data/users/truongnp5/uv_env/nanoqwen35/.cache/nanoqwen35
+export NANOLLM_BASE_DIR=/mnt/data/users/truongnp5/uv_env/nanollm/.cache/nanollm
 
 torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.base_train -- \
     --run qwen_0.8B \
-    --wandb-project nanoqwen35 \
+    --wandb-project nanollm \
     --wandb-entity hkab \
     --wandb-tags "0.8B,pretrain" \
     --pretrained-model-path /mnt/data/huggingface/hub/models--Qwen--Qwen3.5-0.8B-Base/snapshots/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68 \

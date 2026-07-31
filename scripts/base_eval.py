@@ -10,29 +10,37 @@ Default is all three: --eval core,loss,sample
 
 Examples:
 
-    # Evaluate a nanoqwen35 model (e.g. d24) using 8 GPUs
+    # Evaluate a nanollm model (e.g. d24) using 8 GPUs
     torchrun --nproc_per_node=8 -m scripts.base_eval --model-tag d24 --device-batch-size=16
 
     # Quick/approximate evaluation using a single GPU
     python -m scripts.base_eval --model-tag d24 --device-batch-size=16 --max-per-task=100 --split-tokens=524288
 """
-import os
-import csv
-import time
-import json
-import yaml
-import shutil
-import random
-import zipfile
-import tempfile
 import argparse
+import csv
+import json
+import os
+import random
+import shutil
+import tempfile
+import time
+import zipfile
 
-from nanoqwen35.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type
-from nanoqwen35.checkpoint_manager import load_pretrained_hf
-from nanoqwen35.core_eval import evaluate_task
-from nanoqwen35.dataloader import pretrain_loader
-from nanoqwen35.loss_eval import evaluate_loss
-from nanoqwen35.engine import Engine
+import yaml
+
+from nanollm.checkpoint_manager import load_pretrained_hf
+from nanollm.common import (
+    autodetect_device_type,
+    compute_cleanup,
+    compute_init,
+    get_base_dir,
+    print0,
+)
+from nanollm.core_eval import evaluate_task
+from nanollm.dataloader import pretrain_loader
+from nanollm.engine import Engine
+from nanollm.loss_eval import evaluate_loss
+from nanollm.report import get_report       
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
@@ -128,8 +136,8 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
     parser.add_argument('--eval', type=str, default='core,loss,sample', help='Comma-separated evaluations to run: core,loss,sample (default: all)')
-    parser.add_argument('--pretrained-model-path', type=str, default='./Qwen3.5-0.8B', help='path or HF repo id of pretrained model/tokenizer')
-    parser.add_argument('--model-tag', type=str, default=None, help='nanoqwen35 model tag to identify the checkpoint directory')
+    parser.add_argument('--pretrained-model-path', type=str, required=True, help='path or HF repo id of pretrained model/tokenizer')
+    parser.add_argument('--model-tag', type=str, default=None, help='nanollm model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
@@ -240,7 +248,6 @@ def main():
             print0(f"CORE metric: {core_results['core_metric']:.4f}")
 
     # --- Log to report ---
-    from nanoqwen35.report import get_report
     report_data = [{"model": model_name}]
 
     if core_results:

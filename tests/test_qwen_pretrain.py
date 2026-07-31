@@ -1,7 +1,8 @@
-import pytest
 import torch
-from nanoqwen35.checkpoint_manager import load_pretrained_hf
-from nanoqwen35.engine import Engine
+
+from nanollm.checkpoint_manager import load_pretrained_hf
+from nanollm.engine import Engine
+
 
 def test_load_pretrained_and_inference():
     pretrained_dir = "/home/truongnp5/Desktop/qwen35/Qwen3.5-0.8B"

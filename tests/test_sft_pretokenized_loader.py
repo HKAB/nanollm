@@ -1,5 +1,5 @@
 """
-Tests for the pretokenized-SFT dataloader (nanoqwen35.dataloader.sft_pretokenized_loader).
+Tests for the pretokenized-SFT dataloader (nanollm.dataloader.sft_pretokenized_loader).
 
 Run: python -m pytest tests/test_sft_pretokenized_loader.py -v
 
@@ -8,15 +8,13 @@ that the loader reconstructs inputs/targets, applies the loss mask as ignore_ind
 and produces correct block-diagonal cu_seqlens / position_ids.
 """
 import json
-import pytest
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import torch
 
-from nanoqwen35.dataloader import sft_pretokenized_loader, _input_space_segs
-
+from nanollm.dataloader import _input_space_segs, sft_pretokenized_loader
 
 PAD = 99
 

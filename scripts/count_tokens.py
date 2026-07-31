@@ -14,10 +14,14 @@ Usage:
     python -m scripts.count_tokens --data-dir /path/to/pretokenized --tokens-per-row 8192 --workers 16
 """
 
+import sys
 import os
-import glob
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
+import glob
 import multiprocessing as mp
+import os
 
 import pyarrow.parquet as pq
 from tqdm import tqdm

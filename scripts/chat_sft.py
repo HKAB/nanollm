@@ -14,24 +14,43 @@ For RL-style training where only the last assistant turn is supervised:
     --mask-history
 """
 
-import gc
-import argparse
+import sys
 import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import argparse
+import gc
+import os
+
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "nanoqwen35", "inductor"))
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "nanollm", "inductor"))
 import time
-import wandb
+
 import torch
 import torch._inductor.config as inductor_config
+import wandb
+
 inductor_config.fx_graph_cache = True
 
-from nanoqwen35.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanoqwen35.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
-from nanoqwen35.loss_eval import evaluate_loss
-from nanoqwen35.dataloader import sft_loader, sft_pretokenized_loader
 import torch.distributed as dist
-from nanoqwen35.flash_attention import HAS_FA3
-from nanoqwen35.engine import Engine
+
+from nanollm.checkpoint_manager import load_model, load_optimizer_state, save_checkpoint
+from nanollm.common import (
+    COMPUTE_DTYPE,
+    COMPUTE_DTYPE_REASON,
+    DummyWandb,
+    autodetect_device_type,
+    compute_cleanup,
+    compute_init,
+    get_base_dir,
+    get_peak_flops,
+    is_ddp_initialized,
+    print0,
+)
+from nanollm.dataloader import sft_loader, sft_pretokenized_loader
+from nanollm.engine import Engine
+from nanollm.flash_attention import HAS_FA3
+from nanollm.loss_eval import evaluate_loss
 from scripts.chat_eval import run_chat_eval
 
 # -----------------------------------------------------------------------------
@@ -88,7 +107,7 @@ else:
     gpu_peak_flops = float("inf")
 
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanoqwen35-sft", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanollm-sft", name=args.run, config=user_config)
 
 if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
@@ -375,7 +394,8 @@ print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.1f} MiB")
 print0(f"Total training time: {total_train_time/60:.1f}m")
 print0(f"Min val loss: {min_val_loss:.4f}")
 
-from nanoqwen35.report import get_report
+from nanollm.report import get_report
+
 get_report().log(section="SFT", data=[
     user_config,
     {"num_iterations": step, "ddp_world_size": ddp_world_size},

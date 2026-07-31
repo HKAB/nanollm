@@ -1,7 +1,7 @@
 """
 Evaluate the Chat model.
 All the generic code lives here, and all the evaluation-specific
-code lives in nanoqwen35 directory and is imported from here.
+code lives in nanollm directory and is imported from here.
 
 Example runs:
 python -m scripts.chat_eval -a ARC-Easy
@@ -9,13 +9,20 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
 import argparse
+
 import torch
 import torch.distributed as dist
 
-from nanoqwen35.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
-from nanoqwen35.checkpoint_manager import load_model
-from nanoqwen35.engine import Engine
-
+from nanollm.checkpoint_manager import load_model
+from nanollm.report import get_report
+from nanollm.common import (
+    autodetect_device_type,
+    compute_cleanup,
+    compute_init,
+    get_dist_info,
+    print0,
+)
+from nanollm.engine import Engine
 from tasks.global_mmlu import GlobalMMLU
 
 # -----------------------------------------------------------------------------
@@ -153,7 +160,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
                    max_problems=None):
     task_registry = {
-        'GlobalMMLU': GlobalMMLU('./.cache/nanoqwen35/eval_bundle/eval_data/global_mmlu.jsonl'),
+        'GlobalMMLU': GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl'),
     }
     if task_name not in task_registry:
         raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_registry)}")
@@ -214,7 +221,7 @@ if __name__ == "__main__":
         print0(f"{task_name} accuracy: {100 * acc:.2f}%")
 
     # Log to report
-    from nanoqwen35.report import get_report
+    report = get_report()
     all_tasks_were_evaluated = all(task_name in results for task_name in all_tasks)
     # calculate the ChatCORE metric if we can (similar to CORE, it's the mean centered accuracy)
     # this way, ChatCORE ranges from 0 (at random baseline) to 1 (peak performance)

@@ -13,11 +13,12 @@ Note on test structure:
     2. TestSDPAOnly: Tests that only exercise the SDPA fallback path. These can run
        on any device (CUDA, CPU, MPS) with the appropriate dtype for that device.
 """
-import torch
 import pytest
-import nanoqwen35.flash_attention as fa_module
-from nanoqwen35.flash_attention import flash_attn, HAS_FA3
-from nanoqwen35.engine import KVCache
+import torch
+
+import nanollm.flash_attention as fa_module
+from nanollm.engine import KVCache
+from nanollm.flash_attention import HAS_FA3, flash_attn
 
 
 def set_impl(impl):
