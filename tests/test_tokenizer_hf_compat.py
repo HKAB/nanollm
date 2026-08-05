@@ -14,7 +14,7 @@ def hf_tokenizer():
 @pytest.fixture(scope="module")
 def custom_tokenizer():
     try:
-        return get_tokenizer("Qwen/Qwen3.5-0.8B-Base")
+        return get_tokenizer("Qwen/Qwen3.5-0.8B-Base", architectures=["Qwen3_5ForConditionalGeneration"])
     except Exception:
         pytest.skip("Could not load custom tokenizer from Qwen/Qwen3.5-0.8B-Base.")
 

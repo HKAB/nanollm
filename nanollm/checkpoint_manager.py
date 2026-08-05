@@ -97,7 +97,7 @@ def build_model(checkpoint_dir, step, device, phase):
     else:
         model.train()
     # Load the Tokenizer
-    tokenizer = get_tokenizer(os.path.join(checkpoint_dir, 'tokenizer'))
+    tokenizer = get_tokenizer(os.path.join(checkpoint_dir, 'tokenizer'), architectures=architectures)
     return model, tokenizer, meta_data
 
 def find_largest_model(checkpoints_dir):
@@ -170,7 +170,7 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     else:
         model.train()
         
-    tokenizer = get_tokenizer(pretrained_dir)
+    tokenizer = get_tokenizer(pretrained_dir, architectures)
     return model, tokenizer, {"model_config": model_config_kwargs}
 
 def load_model(source, *args, **kwargs):

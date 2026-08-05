@@ -28,7 +28,7 @@ def _load_tokenizer():
         if cand and os.path.isfile(os.path.join(cand, "tokenizer.json")):
             return Tokenizer.from_directory(cand)
     try:
-        return get_tokenizer("Qwen/Qwen3.5-0.8B-Base")
+        return get_tokenizer("Qwen/Qwen3.5-0.8B-Base", architectures=["Qwen3_5ForConditionalGeneration"])
     except Exception:
         return None
 

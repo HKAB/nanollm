@@ -164,7 +164,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     }
     if task_name not in task_registry:
         raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_registry)}")
-    task_object = task_registry[task_name]()
+    task_object = task_registry[task_name]
     if task_object.eval_type == 'generative':
         acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
     elif task_object.eval_type == 'categorical':

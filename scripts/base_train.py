@@ -170,12 +170,6 @@ else:
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------
-# Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer(args.pretrained_model_path)
-vocab_size = tokenizer.get_vocab_size()
-print0(f"Vocab size: {vocab_size:,}")
-
-# -----------------------------------------------------------------------------
 # Initialize the Model
 
 # Load the pretrained model
@@ -183,6 +177,10 @@ print0(f"Loading pretrained model from: {args.pretrained_model_path}")
 model, tokenizer, meta_data_loaded = load_pretrained_hf(args.pretrained_model_path, device, phase="train")
 model_config_kwargs = meta_data_loaded["model_config"]
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+
+# Tokenizer will be useful for evaluation and also we need the vocab size to init the model
+vocab_size = tokenizer.get_vocab_size()
+print0(f"Vocab size: {vocab_size:,}")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()

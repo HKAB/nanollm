@@ -215,6 +215,10 @@ def parse_args():
         "--hf-home", default=None,
         help="Optional override for the HF_HOME cache directory.",
     )
+    parser.add_argument(
+        "--architectures", nargs="+", default=["Qwen3_5ForConditionalGeneration"],
+        help="Model architectures for the tokenizer wrapper (e.g. Qwen3_5ForConditionalGeneration).",
+    )
     return parser.parse_args()
 
 
@@ -314,7 +318,7 @@ def process_chunk(chunk_id, filename, start_byte, end_byte,
 
 def process_chunk_sft(chunk_id, filename, start_byte, end_byte,
                       tokenizer_id, output_dir, seq_len, pack_chunk_size,
-                      long_doc, write_threshold):
+                      long_doc, write_threshold, architectures):
     """SFT worker: read a jsonl byte-range of ShareGPT records, render + smart-chunk
     them, and neat-pack (best-fit) into seq_len-length blocks written as parquet.
 
@@ -322,7 +326,7 @@ def process_chunk_sft(chunk_id, filename, start_byte, end_byte,
     (under-filled) bin of each buffer is simply padded. Returns per-worker stats.
     """
     try:
-        tokenizer = get_tokenizer(tokenizer_id)
+        tokenizer = get_tokenizer(tokenizer_id, architectures=architectures)
         pad_id = tokenizer.get_bos_token_id()
         # Generous per-conversation cap; smart_chunk handles anything longer.
         render_max = seq_len * 16
@@ -421,7 +425,7 @@ def run_sft(args, db_path, all_filename):
                 executor.submit(
                     process_chunk_sft, c_id, filename, start, end,
                     args.tokenizer, args.output_dir, args.seq_len, args.pack_chunk_size,
-                    args.long_doc, args.write_threshold,
+                    args.long_doc, args.write_threshold, args.architectures
                 ): c_id
                 for c_id, start, end in pending_chunks
             }
@@ -453,7 +457,7 @@ def run_sft(args, db_path, all_filename):
 
 def get_tokenizer_sft(args):
     """Load the project tokenizer wrapper used for SFT rendering."""
-    return get_tokenizer(args.tokenizer)
+    return get_tokenizer(args.tokenizer, architectures=args.architectures)
 
 
 def main():

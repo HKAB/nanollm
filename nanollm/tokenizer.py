@@ -101,23 +101,9 @@ class Tokenizer:
         """Override in subclasses to implement model-specific chat templates."""
         raise NotImplementedError("render_for_completion must be implemented by Tokenizer subclasses.")
 
-def get_tokenizer(model_id):
-    from transformers import AutoConfig
+def get_tokenizer(model_id, architectures):
     from nanollm.models.registry import get_model_entry
-    # Try to load config to determine architecture
-    architectures = []
-    try:
-        config_path = os.path.join(model_id, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                architectures = config.get("architectures", [])
-        else:
-            config = AutoConfig.from_pretrained(model_id)
-            architectures = getattr(config, "architectures", [])
-    except Exception:
-        pass
-        
+    
     try:
         entry = get_model_entry(architectures)
         tokenizer_class = entry.get("tokenizer_class", Tokenizer)
