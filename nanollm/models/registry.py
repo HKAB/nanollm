@@ -5,19 +5,12 @@ from nanollm.tokenizers.qwen_tokenizer import QwenTokenizer
 from .qwen import Qwen3_5Model, Qwen3_5ModelConfig
 
 MODEL_REGISTRY = {
-    "Qwen2ForCausalLM": {
+    "Qwen3_5ForConditionalGeneration": {
         "model_class": Qwen3_5Model,
         "config_class": Qwen3_5ModelConfig,
         "tokenizer_class": QwenTokenizer,
-        "config_mapper": "qwen2",
-        "state_dict_mapper": "qwen2",
-    },
-    "Qwen2VLForConditionalGeneration": {
-        "model_class": Qwen3_5Model,
-        "config_class": Qwen3_5ModelConfig,
-        "tokenizer_class": QwenTokenizer,
-        "config_mapper": "qwen2",
-        "state_dict_mapper": "qwen2",
+        "config_mapper": "qwen3_5",
+        "state_dict_mapper": "qwen3_5",
     },
 }
 
@@ -25,7 +18,7 @@ def map_hf_config(hf_config, mapper_type):
     # Some checkpoints nest the language model config under 'text_config'
     config = hf_config.get("text_config", hf_config)
 
-    if mapper_type == "qwen2":
+    if mapper_type == "qwen3_5":
         return {
             "vocab_size": config.get("vocab_size", 152064),
             "context_length": config.get("max_position_embeddings", 4096),
@@ -46,11 +39,12 @@ def map_hf_config(hf_config, mapper_type):
             "linear_value_head_dim": config.get("linear_value_head_dim", 128),
             "linear_conv_kernel_dim": config.get("linear_conv_kernel_dim", 4),
             "hidden_act": config.get("hidden_act", "silu"),
+            "architectures": hf_config.get("architectures", ["Qwen3_5ForConditionalGeneration"]),
         }
     raise ValueError(f"Unknown config mapper {mapper_type}")
 
 def map_hf_state_dict(hf_state_dict, mapper_type):
-    if mapper_type == "qwen2":
+    if mapper_type == "qwen3_5":
         def hf_to_nano_key(k):
             # For multimodal (Qwen-VL)
             k = k.replace("model.language_model.embed_tokens.", "transformer.wte.")

@@ -44,6 +44,7 @@ class Qwen3_5ModelConfig:
     linear_value_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
     hidden_act: str = "silu"
+    architectures: list = None
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward."""

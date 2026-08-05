@@ -138,7 +138,6 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     architectures = hf_config.get("architectures", [])
     entry = get_model_entry(architectures)
     model_config_kwargs = map_hf_config(hf_config, entry["config_mapper"])
-    model_config_kwargs["architectures"] = architectures
     
     model_config = entry["config_class"](**model_config_kwargs)
     with torch.device("meta"):
