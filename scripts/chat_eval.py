@@ -26,8 +26,9 @@ from nanollm.engine import Engine
 from tasks.abmusu import DATASET_NAME as ABMUSU_DATASET_NAME
 from tasks.abmusu import AbMusu
 from tasks.global_mmlu import GlobalMMLU
+from tasks.gsm8k import GSM8K
 from tasks.nlr_causal_reasoning import NLRCausalReasoningVI
-from tasks.uit_viquad import UITViQuADHallucination
+from tasks.uit_viquad import UITViQuADHallucination, UITViQuADQA
 from tasks.uit_vsfc import UITVSFCSentiment
 from tasks.uit_vsmec import UITVSMEC
 from tasks.vianli import ViANLI
@@ -92,6 +93,147 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
     return num_passed/total
 
 
+def run_generative_classification_eval(
+    task_object,
+    tokenizer,
+    model,
+    engine,
+    num_samples,
+    max_new_tokens,
+    temperature,
+    top_k,
+    max_problems=None,
+):
+    """Report accuracy and macro-F1 for generated label predictions."""
+
+    if num_samples != 1:
+        raise ValueError("Classification metrics require --num-samples=1")
+    ddp, ddp_rank, _, ddp_world_size = get_dist_info()
+    device = model.get_device()
+    labels = tuple(task_object.labels)
+    label_to_index = {label: index for index, label in enumerate(labels)}
+    num_problems = len(task_object) if max_problems is None else min(
+        len(task_object), max_problems
+    )
+    if num_problems <= 0:
+        raise ValueError("Classification evaluation requires at least one problem")
+
+    # The last prediction column collects invalid/non-label generations.
+    confusion = torch.zeros(
+        (len(labels), len(labels) + 1), dtype=torch.long, device=device
+    )
+    local_total = local_correct = 0
+    for i in range(ddp_rank, num_problems, ddp_world_size):
+        conversation = task_object[i]
+        encoded_prompt = tokenizer.render_for_completion(
+            conversation, enable_thinking=False
+        )
+        results, _ = engine.generate_batch(
+            encoded_prompt,
+            num_samples=1,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        prediction = tokenizer.decode(results[0][len(encoded_prompt):]).strip()
+        gold_index = label_to_index[conversation["answer"]]
+        prediction_index = label_to_index.get(prediction, len(labels))
+        confusion[gold_index, prediction_index] += 1
+        local_total += 1
+        local_correct += int(gold_index == prediction_index)
+        print(
+            f"\r\033[KRank {ddp_rank} | {local_correct}/{local_total} "
+            f"({100 * local_correct / local_total:.2f}%)",
+            end="",
+            flush=True,
+        )
+    print()
+
+    if ddp:
+        dist.all_reduce(confusion, op=dist.ReduceOp.SUM)
+    total = confusion.sum().item()
+    correct = sum(confusion[index, index].item() for index in range(len(labels)))
+    class_f1 = []
+    for index in range(len(labels)):
+        true_positive = confusion[index, index].item()
+        false_positive = confusion[:, index].sum().item() - true_positive
+        false_negative = confusion[index, :].sum().item() - true_positive
+        support = true_positive + false_negative
+        if support > 0 or false_positive > 0:
+            denominator = 2 * true_positive + false_positive + false_negative
+            class_f1.append(0.0 if denominator == 0 else 2 * true_positive / denominator)
+    metrics = {
+        "accuracy": correct / total,
+        "macro_f1": sum(class_f1) / len(class_f1),
+    }
+    task_object.metrics = metrics
+    print0("=" * 50)
+    print0(f"{type(task_object).__name__} accuracy: {100 * metrics['accuracy']:.2f}%")
+    print0(f"{type(task_object).__name__} macro-F1: {100 * metrics['macro_f1']:.2f}%")
+    return metrics[task_object.primary_metric]
+
+
+def run_extractive_qa_eval(
+    task_object,
+    tokenizer,
+    model,
+    engine,
+    num_samples,
+    max_new_tokens,
+    temperature,
+    top_k,
+    max_problems=None,
+):
+    """Report standard extractive-QA exact match and token F1."""
+
+    if num_samples != 1:
+        raise ValueError("Extractive QA metrics require --num-samples=1")
+    ddp, ddp_rank, _, ddp_world_size = get_dist_info()
+    device = model.get_device()
+    num_problems = len(task_object) if max_problems is None else min(
+        len(task_object), max_problems
+    )
+    if num_problems <= 0:
+        raise ValueError("Extractive QA evaluation requires at least one problem")
+
+    totals = [0.0, 0.0, 0.0]  # count, exact matches, token-F1 sum
+    for i in range(ddp_rank, num_problems, ddp_world_size):
+        conversation = task_object[i]
+        encoded_prompt = tokenizer.render_for_completion(
+            conversation, enable_thinking=False
+        )
+        results, _ = engine.generate_batch(
+            encoded_prompt,
+            num_samples=1,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        completion = tokenizer.decode(results[0][len(encoded_prompt):])
+        score = task_object.evaluate_details(conversation, completion)
+        totals[0] += 1
+        totals[1] += int(score.exact_match)
+        totals[2] += score.f1
+        print(
+            f"\r\033[KRank {ddp_rank} | QA F1 "
+            f"{100 * totals[2] / totals[0]:.2f}% ({int(totals[0])} questions)",
+            end="",
+            flush=True,
+        )
+    print()
+
+    totals_tensor = torch.tensor(totals, dtype=torch.float64, device=device)
+    if ddp:
+        dist.all_reduce(totals_tensor, op=dist.ReduceOp.SUM)
+    total, exact_matches, f1_sum = totals_tensor.tolist()
+    metrics = {"exact_match": exact_matches / total, "f1": f1_sum / total}
+    task_object.metrics = metrics
+    print0("=" * 50)
+    print0(f"UIT-ViQuAD QA exact match: {100 * metrics['exact_match']:.2f}%")
+    print0(f"UIT-ViQuAD QA token F1:    {100 * metrics['f1']:.2f}%")
+    return metrics["f1"]
+
+
 def run_hallucination_eval(
     task_object,
     tokenizer,
@@ -117,8 +259,9 @@ def run_hallucination_eval(
     if num_problems <= 0:
         raise ValueError("UIT-ViQuAD hallucination evaluation needs at least one problem")
 
-    # overall total/correct, answerable total/correct, impossible total/refused.
-    counts = [0, 0, 0, 0, 0, 0]
+    # overall total/correct, answerable total/QA-correct/non-refusal,
+    # impossible total/refused.
+    counts = [0, 0, 0, 0, 0, 0, 0]
     for i in range(ddp_rank, num_problems, ddp_world_size):
         conversation = task_object[i]
         encoded_prompt = tokenizer.render_for_completion(
@@ -136,11 +279,12 @@ def run_hallucination_eval(
         counts[0] += 1
         counts[1] += int(outcome.correct)
         if outcome.is_impossible:
-            counts[4] += 1
-            counts[5] += int(outcome.correct)
+            counts[5] += 1
+            counts[6] += int(outcome.refused)
         else:
             counts[2] += 1
             counts[3] += int(outcome.correct)
+            counts[4] += int(not outcome.refused)
         print(
             f"\r\033[KRank {ddp_rank} | grounded accuracy "
             f"{100 * counts[1] / counts[0]:.2f}% ({counts[0]} questions)",
@@ -153,11 +297,28 @@ def run_hallucination_eval(
         count_tensor = torch.tensor(counts, dtype=torch.long, device=device)
         dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
         counts = count_tensor.tolist()
-    total, correct, answerable, answerable_correct, impossible, refused = counts
+    total, correct, answerable, answerable_correct, answerable_nonrefusal, impossible, refused = counts
     refusal_accuracy = refused / impossible if impossible else 0.0
+
+    def binary_f1(true_positive, false_positive, false_negative):
+        denominator = 2 * true_positive + false_positive + false_negative
+        return 0.0 if denominator == 0 else 2 * true_positive / denominator
+
+    answerable_f1 = binary_f1(
+        answerable_nonrefusal,
+        impossible - refused,
+        answerable - answerable_nonrefusal,
+    )
+    impossible_f1 = binary_f1(
+        refused,
+        answerable - answerable_nonrefusal,
+        impossible - refused,
+    )
     metrics = {
         "overall_accuracy": correct / total,
         "answerable_accuracy": answerable_correct / answerable if answerable else 0.0,
+        "answerability_accuracy": (answerable_nonrefusal + refused) / total,
+        "answerability_macro_f1": (answerable_f1 + impossible_f1) / 2,
         "refusal_accuracy": refusal_accuracy,
         "hallucination_rate": 1.0 - refusal_accuracy if impossible else 0.0,
     }
@@ -165,6 +326,8 @@ def run_hallucination_eval(
     print0("=" * 50)
     print0(f"UIT-ViQuAD overall accuracy:    {100 * metrics['overall_accuracy']:.2f}%")
     print0(f"UIT-ViQuAD answerable accuracy: {100 * metrics['answerable_accuracy']:.2f}%")
+    print0(f"UIT-ViQuAD answerability acc:   {100 * metrics['answerability_accuracy']:.2f}%")
+    print0(f"UIT-ViQuAD answerability F1:    {100 * metrics['answerability_macro_f1']:.2f}%")
     print0(f"UIT-ViQuAD refusal accuracy:    {100 * metrics['refusal_accuracy']:.2f}%")
     print0(f"UIT-ViQuAD hallucination rate:  {100 * metrics['hallucination_rate']:.2f}%")
     return metrics["overall_accuracy"]
@@ -407,16 +570,19 @@ def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
                    max_problems=None, v_ifeval_dataset=V_IFEVAL_DATASET_NAME,
                    v_ifeval_max_new_tokens=None, abmusu_dataset=ABMUSU_DATASET_NAME,
-                   abmusu_max_new_tokens=512, viquad_max_new_tokens=64):
+                   abmusu_max_new_tokens=512, viquad_max_new_tokens=64,
+                   shuffle=False, seed=42):
     task_factories = {
-        'GlobalMMLU': lambda: GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl'),
-        'NLR-Causal-Reasoning-vi': NLRCausalReasoningVI,
-        'UIT-ViQuAD-Hallucination': lambda: UITViQuADHallucination(split='validation'),
-        'UIT-VSFC-Sentiment': UITVSFCSentiment,
-        'UIT-VSMEC': UITVSMEC,
-        'ViANLI': ViANLI,
-        'V-IFEval': lambda: VIFEval(dataset_name=v_ifeval_dataset),
-        'AbMusu': lambda: AbMusu(dataset_name=abmusu_dataset),
+        'GlobalMMLU': lambda: GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl', shuffle=shuffle, seed=seed),
+        'NLR-Causal-Reasoning-vi': lambda: NLRCausalReasoningVI(shuffle=shuffle, seed=seed),
+        'UIT-ViQuAD-Hallucination': lambda: UITViQuADHallucination(split='validation', shuffle=shuffle, seed=seed),
+        'UIT-ViQuAD-QA': lambda: UITViQuADQA(split='validation', shuffle=shuffle, seed=seed),
+        'UIT-VSFC-Sentiment': lambda: UITVSFCSentiment(shuffle=shuffle, seed=seed),
+        'UIT-VSMEC': lambda: UITVSMEC(shuffle=shuffle, seed=seed),
+        'ViANLI': lambda: ViANLI(shuffle=shuffle, seed=seed),
+        'V-IFEval': lambda: VIFEval(dataset_name=v_ifeval_dataset, shuffle=shuffle, seed=seed),
+        'AbMusu': lambda: AbMusu(dataset_name=abmusu_dataset, shuffle=shuffle, seed=seed),
+        'GSM8K': lambda: GSM8K('main', 'test', shuffle=shuffle, seed=seed),
     }
     if task_name not in task_factories:
         raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_factories)}")
@@ -425,6 +591,16 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
     elif task_object.eval_type == 'categorical':
         acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
+    elif task_object.eval_type == 'generative_classification':
+        acc = run_generative_classification_eval(
+            task_object, tokenizer, model, engine, num_samples, max_new_tokens,
+            temperature, top_k, max_problems=max_problems,
+        )
+    elif task_object.eval_type == 'extractive_qa':
+        acc = run_extractive_qa_eval(
+            task_object, tokenizer, model, engine, num_samples, max_new_tokens,
+            temperature, top_k, max_problems=max_problems,
+        )
     elif task_object.eval_type == 'hallucination':
         acc = run_hallucination_eval(
             task_object, tokenizer, model, engine, num_samples, viquad_max_new_tokens,
@@ -485,21 +661,25 @@ if __name__ == "__main__":
         'GlobalMMLU',
         'NLR-Causal-Reasoning-vi',
         'UIT-ViQuAD-Hallucination',
+        'UIT-ViQuAD-QA',
         'UIT-VSMEC',
         'UIT-VSFC-Sentiment',
         'ViANLI',
         'V-IFEval',
         'AbMusu',
+        'GSM8K',
     ]
     baseline_accuracies = {
         'GlobalMMLU': 0.25, # multiple choice 1 of 4 => 25%
         'NLR-Causal-Reasoning-vi': 0.5, # random choice between A and B
         'UIT-ViQuAD-Hallucination': 0.0,
+        'UIT-ViQuAD-QA': 0.0,
         'UIT-VSMEC': 1 / 7, # random choice among seven emotion labels
         'UIT-VSFC-Sentiment': 1 / 3, # random choice among three sentiments
         'ViANLI': 1 / 3, # random choice among three NLI relations
         'V-IFEval': 0.0, # no meaningful random instruction-following baseline
         'AbMusu': 0.0, # no meaningful random summarization baseline
+        'GSM8K': 0.0,
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 
@@ -522,7 +702,12 @@ if __name__ == "__main__":
             viquad_max_new_tokens=args.viquad_max_new_tokens,
         )
         results[task_name] = acc
-        metric_name = "ROUGE-2 F1" if task_name == "AbMusu" else "accuracy"
+        metric_name = {
+            "AbMusu": "ROUGE-2 F1",
+            "UIT-VSMEC": "macro-F1",
+            "UIT-VSFC-Sentiment": "macro-F1",
+            "UIT-ViQuAD-QA": "token F1",
+        }.get(task_name, "accuracy")
         print0(f"{task_name} {metric_name}: {100 * acc:.2f}%")
 
     # Log to report

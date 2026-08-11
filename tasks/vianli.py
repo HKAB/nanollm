@@ -29,7 +29,8 @@ def _render_prompt(premise: str, hypothesis: str) -> str:
 class ViANLI:
     """Answer-only three-way NLI evaluation fixed to the official test split."""
 
-    eval_type = "generative"
+    eval_type = "generative_classification"
+    primary_metric = "accuracy"
     labels = LABELS
     split = EVAL_SPLIT
 
@@ -101,4 +102,3 @@ class ViANLI:
 
     def reward(self, conversation: dict[str, Any], assistant_response: str) -> float:
         return float(self.evaluate(conversation, assistant_response))
-

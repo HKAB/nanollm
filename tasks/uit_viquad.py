@@ -18,6 +18,7 @@ from __future__ import annotations
 import random
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -34,6 +35,13 @@ class HallucinationResult:
     correct: bool
     is_impossible: bool
     hallucinated: bool
+    refused: bool
+
+
+@dataclass(frozen=True)
+class ExtractiveQAScore:
+    exact_match: bool
+    f1: float
 
 
 def _answer_texts(answers: Any) -> list[str]:
@@ -55,6 +63,34 @@ def _normalize_text(text: str) -> str:
     """Normalize harmless formatting differences for extractive QA scoring."""
     text = unicodedata.normalize("NFC", text).strip()
     return re.sub(r"\s+", " ", text).casefold()
+
+
+def _qa_tokens(text: str) -> list[str]:
+    """Vietnamese-safe SQuAD-style tokens for EM/token-F1."""
+
+    normalized = unicodedata.normalize("NFC", text).casefold()
+    normalized = "".join(
+        " " if unicodedata.category(character)[0] in {"P", "S"} else character
+        for character in normalized
+    )
+    return normalized.split()
+
+
+def _score_qa_answer(prediction: str, reference: str) -> ExtractiveQAScore:
+    prediction_tokens = _qa_tokens(prediction)
+    reference_tokens = _qa_tokens(reference)
+    exact_match = prediction_tokens == reference_tokens
+    if not prediction_tokens or not reference_tokens:
+        return ExtractiveQAScore(exact_match, float(exact_match))
+    overlap = sum((Counter(prediction_tokens) & Counter(reference_tokens)).values())
+    if overlap == 0:
+        return ExtractiveQAScore(exact_match, 0.0)
+    precision = overlap / len(prediction_tokens)
+    recall = overlap / len(reference_tokens)
+    return ExtractiveQAScore(
+        exact_match,
+        2 * precision * recall / (precision + recall),
+    )
 
 
 def _render_prompt(context: str, question: str, instruction: str) -> str:
@@ -153,19 +189,20 @@ class UITViQuADHallucination(_UITViQuADBase):
     ) -> HallucinationResult:
         is_impossible = bool(conversation["is_impossible"])
         if not isinstance(assistant_response, str):
-            return HallucinationResult(False, is_impossible, is_impossible)
+            return HallucinationResult(False, is_impossible, is_impossible, False)
 
         if is_impossible:
             # Only the instructed refusal is accepted. Plausible answers are
             # deliberately not gold answers for impossible questions.
             refused = assistant_response.strip() == INSUFFICIENT_CONTEXT_RESPONSE
-            return HallucinationResult(refused, True, not refused)
+            return HallucinationResult(refused, True, not refused, refused)
 
         prediction = _normalize_text(assistant_response)
+        refused = assistant_response.strip() == INSUFFICIENT_CONTEXT_RESPONSE
         correct = bool(prediction) and prediction in {
             _normalize_text(answer) for answer in conversation["answers"]
         }
-        return HallucinationResult(correct, False, False)
+        return HallucinationResult(correct, False, False, refused)
 
     def evaluate(self, conversation: dict[str, Any], assistant_response: str) -> bool:
         return self.evaluate_details(conversation, assistant_response).correct
@@ -177,6 +214,8 @@ UITViQuADAnswerability = UITViQuADHallucination
 
 class UITViQuADQA(_UITViQuADBase):
     """Answer-only extractive QA using the answerable ViQuAD examples."""
+
+    eval_type = "extractive_qa"
 
     def _prepare_dataset(self, ds: Any) -> Any:
         if hasattr(ds, "filter"):
@@ -205,13 +244,22 @@ class UITViQuADQA(_UITViQuADBase):
             **self._metadata(row),
         }
 
-    def evaluate(self, conversation: dict[str, Any], assistant_response: str) -> bool:
+    def evaluate_details(
+        self, conversation: dict[str, Any], assistant_response: str
+    ) -> ExtractiveQAScore:
         if not isinstance(assistant_response, str):
-            return False
-        prediction = _normalize_text(assistant_response)
-        return bool(prediction) and prediction in {
-            _normalize_text(answer) for answer in conversation["answers"]
-        }
+            return ExtractiveQAScore(False, 0.0)
+        scores = [
+            _score_qa_answer(assistant_response, answer)
+            for answer in conversation["answers"]
+        ]
+        return ExtractiveQAScore(
+            any(score.exact_match for score in scores),
+            max((score.f1 for score in scores), default=0.0),
+        )
+
+    def evaluate(self, conversation: dict[str, Any], assistant_response: str) -> bool:
+        return self.evaluate_details(conversation, assistant_response).exact_match
 
 
 def iter_sft_messages(task: _UITViQuADBase) -> Iterable[list[dict[str, str]]]:

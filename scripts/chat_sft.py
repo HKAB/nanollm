@@ -53,6 +53,23 @@ from nanollm.flash_attention import HAS_FA3
 from nanollm.loss_eval import evaluate_loss
 from scripts.chat_eval import run_chat_eval
 
+
+# Bounded periodic evaluation: categorical tasks can afford larger subsets;
+# long-form generation gets smaller but still representative samples.
+CHATCORE_TASK_CONFIG = {
+    "GlobalMMLU": {"limit": 500, "baseline": 0.25, "max_new_tokens": 8},
+    "NLR-Causal-Reasoning-vi": {"limit": 500, "baseline": 0.5, "max_new_tokens": 8},
+    "ViANLI": {"limit": 300, "baseline": 1 / 3, "max_new_tokens": 16},
+    "UIT-VSMEC": {"limit": 350, "baseline": 1 / 7, "max_new_tokens": 16},
+    "UIT-VSFC-Sentiment": {"limit": 300, "baseline": 1 / 3, "max_new_tokens": 16},
+    "UIT-ViQuAD-QA": {"limit": 250, "baseline": 0.0, "max_new_tokens": 64},
+    "UIT-ViQuAD-Hallucination": {"limit": 250, "baseline": 0.0, "max_new_tokens": 64},
+    "V-IFEval": {"limit": 500, "baseline": 0.0, "max_new_tokens": 1024},
+    # Validation has only 100 labeled clusters; the 300-example test is unlabeled.
+    "AbMusu": {"limit": 100, "baseline": 0.0, "max_new_tokens": 384},
+    "GSM8K": {"limit": 200, "baseline": 0.0, "max_new_tokens": 256},
+}
+
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="SFT / RL fine-tuning")
@@ -280,26 +297,44 @@ while True:
         model.eval()
         engine = Engine(orig_model, tokenizer)
         
-        categorical_tasks = ["GlobalMMLU"]
-        baseline_accuracies = {
-            'GlobalMMLU': 0.25,  # Random baseline
-        }
         task_results = {}
-        for task_name in categorical_tasks:
-            acc = run_chat_eval(task_name, model, tokenizer, engine, batch_size=args.device_batch_size)
+        for task_name, task_config in CHATCORE_TASK_CONFIG.items():
+            limit = task_config["limit"]
+            max_new_tokens = task_config["max_new_tokens"]
+            acc = run_chat_eval(
+                task_name,
+                model,
+                tokenizer,
+                engine,
+                batch_size=args.device_batch_size,
+                max_new_tokens=max_new_tokens,
+                max_problems=limit,
+                v_ifeval_max_new_tokens=max_new_tokens,
+                abmusu_max_new_tokens=max_new_tokens,
+                viquad_max_new_tokens=max_new_tokens,
+                shuffle=True,
+                seed=42,
+            )
             task_results[task_name] = acc
-            print0(f"Step {step:05d} | ChatCORE {task_name}: {100*acc:.2f}%")
-        
-        def centered_mean(tasks):
-            return sum((task_results[t] - baseline_accuracies[t]) / (1.0 - baseline_accuracies[t]) for t in tasks) / len(tasks)
+            print0(
+                f"Step {step:05d} | ChatCORE {task_name} "
+                f"(N={limit}): {100 * acc:.2f}%"
+            )
+            gc.collect()
+            if device_type == "cuda":
+                torch.cuda.empty_cache()
 
-        chatcore_cat = centered_mean(categorical_tasks)
+        centered_scores = []
+        for task_name, score in task_results.items():
+            baseline = CHATCORE_TASK_CONFIG[task_name]["baseline"]
+            centered_scores.append((score - baseline) / (1.0 - baseline))
+        chatcore = sum(centered_scores) / len(centered_scores)
 
-        print0(f"Step {step:05d} | ChatCORE_cat: {chatcore_cat:.4f}")
+        print0(f"Step {step:05d} | ChatCORE: {chatcore:.4f}")
         wandb_run.log({
             "step": step,
-            "chatcore_cat": chatcore_cat,
-            **{f"chatcore_{t}": task_results[t] for t in categorical_tasks},
+            "chatcore": chatcore,
+            **{f"chatcore/{task_name}": score for task_name, score in task_results.items()},
         })
         model.train()
 

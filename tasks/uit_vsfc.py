@@ -29,7 +29,9 @@ class UITVSFCSentiment:
     ``sentence`` as input and ``sentiment`` as its target.
     """
 
-    eval_type = "generative"
+    eval_type = "generative_classification"
+    primary_metric = "macro_f1"
+    labels = SENTIMENTS
     sentiments = SENTIMENTS
     split = EVAL_SPLIT
 
@@ -100,4 +102,3 @@ class UITVSFCSentiment:
 
     def reward(self, conversation: dict[str, Any], assistant_response: str) -> float:
         return float(self.evaluate(conversation, assistant_response))
-

@@ -125,6 +125,8 @@ def test_hallucination_runner_reports_balanced_metrics(monkeypatch):
     assert task.metrics == {
         "overall_accuracy": 1.0,
         "answerable_accuracy": 1.0,
+        "answerability_accuracy": 1.0,
+        "answerability_macro_f1": 1.0,
         "refusal_accuracy": 1.0,
         "hallucination_rate": 0.0,
     }
@@ -138,6 +140,9 @@ def test_qa_filters_impossible_examples_and_scores_gold_variants(monkeypatch):
     assert task[0]["messages"][-1]["content"] == "bảy"
     assert task.evaluate(task[0], "  BẢY  ")
     assert not task.evaluate(task[0], "Có bảy lớp từ.")
+    partial = task.evaluate_details(task[0], "Có bảy lớp từ.")
+    assert not partial.exact_match
+    assert partial.f1 == 0.4
 
 
 def test_limit_is_applied_after_qa_filter(monkeypatch):

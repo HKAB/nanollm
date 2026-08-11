@@ -1,4 +1,6 @@
 from tasks.abmusu import AbMusu
+from tasks.global_mmlu import GlobalMMLU
+from tasks.gsm8k import GSM8K
 from tasks.nlr_causal_reasoning import NLRCausalReasoningVI
 from tasks.uit_viquad import (
     UITViQuADAnswerability,
@@ -12,6 +14,8 @@ from tasks.v_ifeval import VIFEval
 
 __all__ = [
     "AbMusu",
+    "GlobalMMLU",
+    "GSM8K",
     "NLRCausalReasoningVI",
     "UITViQuADAnswerability",
     "UITViQuADHallucination",

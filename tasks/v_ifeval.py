@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -156,10 +157,18 @@ class VIFEval:
         v_ifeval_path: str | os.PathLike[str] | None = None,
         dataset: Any | None = None,
         registry: Mapping[str, type] | None = None,
+        shuffle: bool = False,
+        seed: int = 42,
     ):
         self.dataset_name = dataset_name
         self.split = split
         self.ds = dataset if dataset is not None else load_dataset(dataset_name, split=split)
+        if shuffle:
+            if hasattr(self.ds, "shuffle"):
+                self.ds = self.ds.shuffle(seed=seed)
+            else:
+                self.ds = list(self.ds)
+                random.Random(seed).shuffle(self.ds)
         self.registry = (
             registry if registry is not None else load_instruction_registry(v_ifeval_path)
         )

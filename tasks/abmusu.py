@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import re
 import unicodedata
 from collections import Counter
@@ -102,12 +103,20 @@ class AbMusu:
         split: str = EVAL_SPLIT,
         dataset: Any | None = None,
         limit: int | None = None,
+        shuffle: bool = False,
+        seed: int = 42,
     ):
         if split not in SPLITS:
             raise ValueError(f"split must be one of {sorted(SPLITS)}, got {split!r}")
         if limit is not None and limit < 0:
             raise ValueError("limit must be non-negative or None")
         ds = dataset if dataset is not None else load_dataset(dataset_name, split=split)
+        if shuffle:
+            if hasattr(ds, "shuffle"):
+                ds = ds.shuffle(seed=seed)
+            else:
+                ds = list(ds)
+                random.Random(seed).shuffle(ds)
         if limit is not None:
             if hasattr(ds, "select"):
                 ds = ds.select(range(min(limit, len(ds))))

@@ -39,7 +39,9 @@ class UITVSMEC:
     examples.
     """
 
-    eval_type = "generative"
+    eval_type = "generative_classification"
+    primary_metric = "macro_f1"
+    labels = EMOTIONS
     emotions = EMOTIONS
     split = EVAL_SPLIT
 
@@ -106,4 +108,3 @@ class UITVSMEC:
 
     def reward(self, conversation: dict[str, Any], assistant_response: str) -> float:
         return float(self.evaluate(conversation, assistant_response))
-
