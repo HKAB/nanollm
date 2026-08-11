@@ -29,7 +29,7 @@ from tasks.global_mmlu import GlobalMMLU
 from tasks.gsm8k import GSM8K
 from tasks.nlr_causal_reasoning import NLRCausalReasoningVI
 from tasks.uit_viquad import UITViQuADHallucination, UITViQuADQA
-from tasks.uit_vsfc import UITVSFCSentiment
+from tasks.uit_vsfc import DATASET_NAME as UIT_VSFC_DATASET_NAME, UITVSFCSentiment
 from tasks.uit_vsmec import UITVSMEC
 from tasks.vianli import ViANLI
 from tasks.v_ifeval import DATASET_NAME as V_IFEVAL_DATASET_NAME
@@ -571,13 +571,16 @@ def run_chat_eval(task_name, model, tokenizer, engine,
                    max_problems=None, v_ifeval_dataset=V_IFEVAL_DATASET_NAME,
                    v_ifeval_max_new_tokens=None, abmusu_dataset=ABMUSU_DATASET_NAME,
                    abmusu_max_new_tokens=512, viquad_max_new_tokens=64,
+                   uit_vsfc_dataset=UIT_VSFC_DATASET_NAME,
                    shuffle=False, seed=42):
     task_factories = {
         'GlobalMMLU': lambda: GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl', shuffle=shuffle, seed=seed),
         'NLR-Causal-Reasoning-vi': lambda: NLRCausalReasoningVI(shuffle=shuffle, seed=seed),
         'UIT-ViQuAD-Hallucination': lambda: UITViQuADHallucination(split='validation', shuffle=shuffle, seed=seed),
         'UIT-ViQuAD-QA': lambda: UITViQuADQA(split='validation', shuffle=shuffle, seed=seed),
-        'UIT-VSFC-Sentiment': lambda: UITVSFCSentiment(shuffle=shuffle, seed=seed),
+        'UIT-VSFC-Sentiment': lambda: UITVSFCSentiment(
+            dataset_name=uit_vsfc_dataset, shuffle=shuffle, seed=seed
+        ),
         'UIT-VSMEC': lambda: UITVSMEC(shuffle=shuffle, seed=seed),
         'ViANLI': lambda: ViANLI(shuffle=shuffle, seed=seed),
         'V-IFEval': lambda: VIFEval(dataset_name=v_ifeval_dataset, shuffle=shuffle, seed=seed),
@@ -647,6 +650,8 @@ if __name__ == "__main__":
                         help='Maximum generated tokens for each AbMusu summary')
     parser.add_argument('--viquad-max-new-tokens', type=int, default=64,
                         help='Maximum generated tokens for grounded ViQuAD answers')
+    parser.add_argument('--uit-vsfc-dataset', default=UIT_VSFC_DATASET_NAME,
+                        help='Data-only Hugging Face mirror of UIT-VSFC')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
     args = parser.parse_args()
 
@@ -700,6 +705,7 @@ if __name__ == "__main__":
             abmusu_dataset=args.abmusu_dataset,
             abmusu_max_new_tokens=args.abmusu_max_new_tokens,
             viquad_max_new_tokens=args.viquad_max_new_tokens,
+            uit_vsfc_dataset=args.uit_vsfc_dataset,
         )
         results[task_name] = acc
         metric_name = {

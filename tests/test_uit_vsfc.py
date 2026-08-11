@@ -37,8 +37,15 @@ def test_task_always_loads_test_split(monkeypatch):
     calls = _patch_dataset(monkeypatch)
     task = uit_vsfc.UITVSFCSentiment()
 
-    assert calls == [("uitnlp/vietnamese_students_feedback", "test")]
+    assert calls == [("truongnp5/vietnamese_students_feedback", "test")]
     assert task.split == "test"
+
+
+def test_dataset_mirror_can_be_overridden(monkeypatch):
+    calls = _patch_dataset(monkeypatch)
+    uit_vsfc.UITVSFCSentiment(dataset_name="account/custom-vsfc")
+
+    assert calls == [("account/custom-vsfc", "test")]
 
 
 def test_sentiment_mapping_and_topic_is_ignored(monkeypatch):

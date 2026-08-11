@@ -8,7 +8,9 @@ from typing import Any
 from datasets import load_dataset
 
 
-DATASET_NAME = "uitnlp/vietnamese_students_feedback"
+# Data-only mirror created by scripts/upload_uit_vsfc.py.  The upstream repo
+# uses a legacy datasets loading script, which datasets>=4 no longer executes.
+DATASET_NAME = "truongnp5/vietnamese_students_feedback"
 EVAL_SPLIT = "test"
 SENTIMENTS = ("negative", "neutral", "positive")
 
@@ -38,6 +40,7 @@ class UITVSFCSentiment:
     def __init__(
         self,
         *,
+        dataset_name: str = DATASET_NAME,
         limit: int | None = None,
         shuffle: bool = False,
         seed: int = 42,
@@ -45,7 +48,8 @@ class UITVSFCSentiment:
         if limit is not None and limit < 0:
             raise ValueError("limit must be non-negative or None")
 
-        ds = load_dataset(DATASET_NAME, split=EVAL_SPLIT)
+        ds = load_dataset(dataset_name, split=EVAL_SPLIT)
+        self.dataset_name = dataset_name
         if shuffle:
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed=seed)
