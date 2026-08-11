@@ -216,12 +216,12 @@ class QwenTokenizer(Tokenizer):
             return ids, mask, boundaries
         return ids, mask
 
-    def render_for_completion(self, conversation, enable_thinking=True):
+    def render_for_completion(self, conversation, enable_thinking=True, max_tokens=2048):
         conversation = copy.deepcopy(conversation)
         messages = conversation["messages"]
         assert messages[-1]["role"] == "assistant"
         messages.pop()
-        ids, _ = self.render_conversation(conversation)
+        ids, _ = self.render_conversation(conversation, max_tokens=max_tokens)
 
         im_start = self.encode_special("<|im_start|>")
         if im_start is None:

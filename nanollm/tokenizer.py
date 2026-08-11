@@ -97,7 +97,7 @@ class Tokenizer:
         """Override in subclasses to implement model-specific chat templates."""
         raise NotImplementedError("render_conversation must be implemented by Tokenizer subclasses.")
 
-    def render_for_completion(self, conversation, enable_thinking=True):
+    def render_for_completion(self, conversation, enable_thinking=True, max_tokens=2048):
         """Override in subclasses to implement model-specific chat templates."""
         raise NotImplementedError("render_for_completion must be implemented by Tokenizer subclasses.")
 

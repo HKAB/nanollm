@@ -23,7 +23,16 @@ from nanollm.common import (
     print0,
 )
 from nanollm.engine import Engine
+from tasks.abmusu import DATASET_NAME as ABMUSU_DATASET_NAME
+from tasks.abmusu import AbMusu
 from tasks.global_mmlu import GlobalMMLU
+from tasks.nlr_causal_reasoning import NLRCausalReasoningVI
+from tasks.uit_viquad import UITViQuADHallucination
+from tasks.uit_vsfc import UITVSFCSentiment
+from tasks.uit_vsmec import UITVSMEC
+from tasks.vianli import ViANLI
+from tasks.v_ifeval import DATASET_NAME as V_IFEVAL_DATASET_NAME
+from tasks.v_ifeval import VIFEval
 
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
@@ -81,6 +90,244 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
     # Return the accuracy
     return num_passed/total
+
+
+def run_hallucination_eval(
+    task_object,
+    tokenizer,
+    model,
+    engine,
+    num_samples,
+    max_new_tokens,
+    temperature,
+    top_k,
+    max_problems=None,
+):
+    """Evaluate grounded QA and exact refusal behavior on UIT-ViQuAD2.0."""
+
+    if num_samples != 1:
+        raise ValueError(
+            "UIT-ViQuAD hallucination evaluation requires --num-samples=1"
+        )
+    ddp, ddp_rank, _, ddp_world_size = get_dist_info()
+    device = model.get_device()
+    num_problems = len(task_object) if max_problems is None else min(
+        len(task_object), max_problems
+    )
+    if num_problems <= 0:
+        raise ValueError("UIT-ViQuAD hallucination evaluation needs at least one problem")
+
+    # overall total/correct, answerable total/correct, impossible total/refused.
+    counts = [0, 0, 0, 0, 0, 0]
+    for i in range(ddp_rank, num_problems, ddp_world_size):
+        conversation = task_object[i]
+        encoded_prompt = tokenizer.render_for_completion(
+            conversation, enable_thinking=False
+        )
+        results, _ = engine.generate_batch(
+            encoded_prompt,
+            num_samples=1,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        completion = tokenizer.decode(results[0][len(encoded_prompt):])
+        outcome = task_object.evaluate_details(conversation, completion)
+        counts[0] += 1
+        counts[1] += int(outcome.correct)
+        if outcome.is_impossible:
+            counts[4] += 1
+            counts[5] += int(outcome.correct)
+        else:
+            counts[2] += 1
+            counts[3] += int(outcome.correct)
+        print(
+            f"\r\033[KRank {ddp_rank} | grounded accuracy "
+            f"{100 * counts[1] / counts[0]:.2f}% ({counts[0]} questions)",
+            end="",
+            flush=True,
+        )
+    print()
+
+    if ddp:
+        count_tensor = torch.tensor(counts, dtype=torch.long, device=device)
+        dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+        counts = count_tensor.tolist()
+    total, correct, answerable, answerable_correct, impossible, refused = counts
+    refusal_accuracy = refused / impossible if impossible else 0.0
+    metrics = {
+        "overall_accuracy": correct / total,
+        "answerable_accuracy": answerable_correct / answerable if answerable else 0.0,
+        "refusal_accuracy": refusal_accuracy,
+        "hallucination_rate": 1.0 - refusal_accuracy if impossible else 0.0,
+    }
+    task_object.metrics = metrics
+    print0("=" * 50)
+    print0(f"UIT-ViQuAD overall accuracy:    {100 * metrics['overall_accuracy']:.2f}%")
+    print0(f"UIT-ViQuAD answerable accuracy: {100 * metrics['answerable_accuracy']:.2f}%")
+    print0(f"UIT-ViQuAD refusal accuracy:    {100 * metrics['refusal_accuracy']:.2f}%")
+    print0(f"UIT-ViQuAD hallucination rate:  {100 * metrics['hallucination_rate']:.2f}%")
+    return metrics["overall_accuracy"]
+
+
+def run_instruction_following_eval(
+    task_object,
+    tokenizer,
+    model,
+    engine,
+    num_samples,
+    max_new_tokens,
+    temperature,
+    top_k,
+    max_problems=None,
+):
+    """Run V-IFEval and aggregate its official strict/loose metrics."""
+
+    if num_samples != 1:
+        raise ValueError("V-IFEval requires --num-samples=1 for comparable accuracy")
+
+    ddp, ddp_rank, _, ddp_world_size = get_dist_info()
+    device = model.get_device()
+    num_problems = len(task_object) if max_problems is None else min(
+        len(task_object), max_problems
+    )
+    if num_problems <= 0:
+        raise ValueError("V-IFEval requires at least one problem")
+
+    # prompt total/correct, instruction total/correct, first strict then loose.
+    counts = [0, 0, 0, 0, 0, 0]
+    for i in range(ddp_rank, num_problems, ddp_world_size):
+        conversation = task_object[i]
+        # Empty thinking keeps hidden reasoning from contaminating format checks.
+        encoded_prompt = tokenizer.render_for_completion(
+            conversation, enable_thinking=False
+        )
+        results, _ = engine.generate_batch(
+            encoded_prompt,
+            num_samples=1,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        completion = tokenizer.decode(results[0][len(encoded_prompt):])
+        outcome = task_object.evaluate_details(conversation, completion)
+
+        counts[0] += 1
+        counts[1] += int(outcome.strict_prompt)
+        counts[2] += len(outcome.strict)
+        counts[3] += sum(outcome.strict)
+        counts[4] += int(outcome.loose_prompt)
+        counts[5] += sum(outcome.loose)
+        print(
+            f"\r\033[KRank {ddp_rank} | strict prompts "
+            f"{counts[1]}/{counts[0]} ({100 * counts[1] / counts[0]:.2f}%)",
+            end="",
+            flush=True,
+        )
+    print()
+
+    if ddp:
+        count_tensor = torch.tensor(counts, dtype=torch.long, device=device)
+        dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+        counts = count_tensor.tolist()
+
+    prompt_total, strict_prompts, instruction_total, strict_instructions, loose_prompts, loose_instructions = counts
+    metrics = {
+        "strict_prompt_accuracy": strict_prompts / prompt_total,
+        "strict_instruction_accuracy": strict_instructions / instruction_total,
+        "loose_prompt_accuracy": loose_prompts / prompt_total,
+        "loose_instruction_accuracy": loose_instructions / instruction_total,
+    }
+    task_object.metrics = metrics
+    print0("=" * 50)
+    print0(f"V-IFEval strict prompt:      {100 * metrics['strict_prompt_accuracy']:.2f}%")
+    print0(f"V-IFEval strict instruction: {100 * metrics['strict_instruction_accuracy']:.2f}%")
+    print0(f"V-IFEval loose prompt:       {100 * metrics['loose_prompt_accuracy']:.2f}%")
+    print0(f"V-IFEval loose instruction:  {100 * metrics['loose_instruction_accuracy']:.2f}%")
+    return metrics["strict_prompt_accuracy"]
+
+
+def run_summarization_eval(
+    task_object,
+    tokenizer,
+    model,
+    engine,
+    num_samples,
+    max_new_tokens,
+    temperature,
+    top_k,
+    max_problems=None,
+):
+    """Generate one summary per cluster and macro-average ROUGE-2."""
+
+    if num_samples != 1:
+        raise ValueError("AbMusu requires --num-samples=1 for comparable ROUGE")
+    if max_new_tokens <= 0:
+        raise ValueError("AbMusu max new tokens must be positive")
+
+    ddp, ddp_rank, _, ddp_world_size = get_dist_info()
+    device = model.get_device()
+    num_problems = len(task_object) if max_problems is None else min(
+        len(task_object), max_problems
+    )
+    if num_problems <= 0:
+        raise ValueError("AbMusu requires at least one problem")
+
+    context_length = getattr(model.config, "context_length", 4096)
+    # Leave room for the assistant header inserted after conversation rendering.
+    max_prompt_tokens = context_length - max_new_tokens - 32
+    if max_prompt_tokens <= 0:
+        raise ValueError(
+            f"AbMusu needs max_new_tokens smaller than context length {context_length}"
+        )
+
+    total = 0
+    precision_sum = recall_sum = f1_sum = 0.0
+    for i in range(ddp_rank, num_problems, ddp_world_size):
+        conversation = task_object[i]
+        encoded_prompt = tokenizer.render_for_completion(
+            conversation,
+            enable_thinking=False,
+            max_tokens=max_prompt_tokens,
+        )
+        results, _ = engine.generate_batch(
+            encoded_prompt,
+            num_samples=1,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        completion = tokenizer.decode(results[0][len(encoded_prompt):])
+        score = task_object.evaluate_details(conversation, completion)
+        total += 1
+        precision_sum += score.precision
+        recall_sum += score.recall
+        f1_sum += score.f1
+        print(
+            f"\r\033[KRank {ddp_rank} | ROUGE-2 F1 "
+            f"{100 * f1_sum / total:.2f}% ({total} clusters)",
+            end="",
+            flush=True,
+        )
+    print()
+
+    totals = [total, precision_sum, recall_sum, f1_sum]
+    if ddp:
+        totals_tensor = torch.tensor(totals, dtype=torch.float64, device=device)
+        dist.all_reduce(totals_tensor, op=dist.ReduceOp.SUM)
+        totals = totals_tensor.tolist()
+    total, precision_sum, recall_sum, f1_sum = totals
+    metrics = {
+        "rouge2_precision": precision_sum / total,
+        "rouge2_recall": recall_sum / total,
+        "rouge2_f1": f1_sum / total,
+    }
+    task_object.metrics = metrics
+    print0("=" * 50)
+    print0(f"AbMusu ROUGE-2 precision: {100 * metrics['rouge2_precision']:.2f}%")
+    print0(f"AbMusu ROUGE-2 recall:    {100 * metrics['rouge2_recall']:.2f}%")
+    print0(f"AbMusu ROUGE-2 F1:        {100 * metrics['rouge2_f1']:.2f}%")
+    return metrics["rouge2_f1"]
 
 # -----------------------------------------------------------------------------
 # Categorical evaluation loop
@@ -158,17 +405,43 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 
 def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
-                   max_problems=None):
-    task_registry = {
-        'GlobalMMLU': GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl'),
+                   max_problems=None, v_ifeval_dataset=V_IFEVAL_DATASET_NAME,
+                   v_ifeval_max_new_tokens=None, abmusu_dataset=ABMUSU_DATASET_NAME,
+                   abmusu_max_new_tokens=512, viquad_max_new_tokens=64):
+    task_factories = {
+        'GlobalMMLU': lambda: GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl'),
+        'NLR-Causal-Reasoning-vi': NLRCausalReasoningVI,
+        'UIT-ViQuAD-Hallucination': lambda: UITViQuADHallucination(split='validation'),
+        'UIT-VSFC-Sentiment': UITVSFCSentiment,
+        'UIT-VSMEC': UITVSMEC,
+        'ViANLI': ViANLI,
+        'V-IFEval': lambda: VIFEval(dataset_name=v_ifeval_dataset),
+        'AbMusu': lambda: AbMusu(dataset_name=abmusu_dataset),
     }
-    if task_name not in task_registry:
-        raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_registry)}")
-    task_object = task_registry[task_name]
+    if task_name not in task_factories:
+        raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_factories)}")
+    task_object = task_factories[task_name]()
     if task_object.eval_type == 'generative':
         acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
     elif task_object.eval_type == 'categorical':
         acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
+    elif task_object.eval_type == 'hallucination':
+        acc = run_hallucination_eval(
+            task_object, tokenizer, model, engine, num_samples, viquad_max_new_tokens,
+            temperature, top_k, max_problems=max_problems,
+        )
+    elif task_object.eval_type == 'instruction_following':
+        instruction_max_tokens = v_ifeval_max_new_tokens or max_new_tokens
+        acc = run_instruction_following_eval(
+            task_object, tokenizer, model, engine, num_samples, instruction_max_tokens,
+            temperature, top_k, max_problems=max_problems,
+        )
+    elif task_object.eval_type == 'summarization':
+        acc = run_summarization_eval(
+            task_object, tokenizer, model, engine, num_samples,
+            abmusu_max_new_tokens, temperature, top_k,
+            max_problems=max_problems,
+        )
     else:
         raise ValueError(f"Unsupported task evaluation type: {task_object.eval_type}")
     return acc
@@ -188,6 +461,16 @@ if __name__ == "__main__":
     parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
+    parser.add_argument('--v-ifeval-dataset', default=V_IFEVAL_DATASET_NAME,
+                        help='Hugging Face dataset repo containing data/test.jsonl')
+    parser.add_argument('--v-ifeval-max-new-tokens', type=int, default=2048,
+                        help='V-IFEval response limit (official evaluator uses 2048)')
+    parser.add_argument('--abmusu-dataset', default=ABMUSU_DATASET_NAME,
+                        help='Hugging Face AbMusu dataset repo')
+    parser.add_argument('--abmusu-max-new-tokens', type=int, default=512,
+                        help='Maximum generated tokens for each AbMusu summary')
+    parser.add_argument('--viquad-max-new-tokens', type=int, default=64,
+                        help='Maximum generated tokens for grounded ViQuAD answers')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
     args = parser.parse_args()
 
@@ -198,9 +481,25 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
-    all_tasks = ['GlobalMMLU']  # Add more tasks here as they are implemented
+    all_tasks = [
+        'GlobalMMLU',
+        'NLR-Causal-Reasoning-vi',
+        'UIT-ViQuAD-Hallucination',
+        'UIT-VSMEC',
+        'UIT-VSFC-Sentiment',
+        'ViANLI',
+        'V-IFEval',
+        'AbMusu',
+    ]
     baseline_accuracies = {
         'GlobalMMLU': 0.25, # multiple choice 1 of 4 => 25%
+        'NLR-Causal-Reasoning-vi': 0.5, # random choice between A and B
+        'UIT-ViQuAD-Hallucination': 0.0,
+        'UIT-VSMEC': 1 / 7, # random choice among seven emotion labels
+        'UIT-VSFC-Sentiment': 1 / 3, # random choice among three sentiments
+        'ViANLI': 1 / 3, # random choice among three NLI relations
+        'V-IFEval': 0.0, # no meaningful random instruction-following baseline
+        'AbMusu': 0.0, # no meaningful random summarization baseline
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 
@@ -216,9 +515,15 @@ if __name__ == "__main__":
             temperature=args.temperature,
             top_k=args.top_k,
             max_problems=args.max_problems,
+            v_ifeval_dataset=args.v_ifeval_dataset,
+            v_ifeval_max_new_tokens=args.v_ifeval_max_new_tokens,
+            abmusu_dataset=args.abmusu_dataset,
+            abmusu_max_new_tokens=args.abmusu_max_new_tokens,
+            viquad_max_new_tokens=args.viquad_max_new_tokens,
         )
         results[task_name] = acc
-        print0(f"{task_name} accuracy: {100 * acc:.2f}%")
+        metric_name = "ROUGE-2 F1" if task_name == "AbMusu" else "accuracy"
+        print0(f"{task_name} {metric_name}: {100 * acc:.2f}%")
 
     # Log to report
     report = get_report()
