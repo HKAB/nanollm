@@ -19,6 +19,31 @@ V_IFEVAL_ENV = "V_IFEVAL_PATH"
 DEFAULT_V_IFEVAL_PATH = Path(".cache/V-IFEval")
 
 
+def _load_eval_dataset(dataset_name: str, split: str) -> Any:
+    """Load a Hub dataset, bypassing incompatible exported feature metadata.
+
+    Some newer Hub datasets describe arbitrary dictionaries with the ``Json``
+    feature.  datasets 4.0.0 cannot deserialize that feature metadata even
+    though its Arrow/Parquet reader can read the underlying values.  Loading
+    the pushed Parquet shard directly avoids the metadata compatibility issue.
+    """
+
+    try:
+        return load_dataset(dataset_name, split=split)
+    except ValueError as error:
+        if "Feature type 'Json' not found" not in str(error):
+            raise
+
+    data_file = f"hf://datasets/{dataset_name}/data/{split}-*.parquet"
+    try:
+        return load_dataset("parquet", data_files={split: data_file}, split=split)
+    except Exception as fallback_error:
+        raise RuntimeError(
+            f"Could not load {dataset_name!r} after bypassing its incompatible "
+            "Json feature metadata"
+        ) from fallback_error
+
+
 @dataclass(frozen=True)
 class VIFEvalResult:
     """Per-example results matching V-IFEval's strict and loose evaluators."""
@@ -162,7 +187,11 @@ class VIFEval:
     ):
         self.dataset_name = dataset_name
         self.split = split
-        self.ds = dataset if dataset is not None else load_dataset(dataset_name, split=split)
+        self.ds = (
+            dataset
+            if dataset is not None
+            else _load_eval_dataset(dataset_name, split)
+        )
         if shuffle:
             if hasattr(self.ds, "shuffle"):
                 self.ds = self.ds.shuffle(seed=seed)

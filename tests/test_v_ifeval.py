@@ -1,3 +1,4 @@
+from tasks import v_ifeval
 from tasks.v_ifeval import VIFEval, aggregate_results, evaluate_response
 
 
@@ -66,3 +67,49 @@ def test_non_string_response_fails_every_instruction():
     result = evaluate_response(ROWS[0], None, REGISTRY)
     assert result.strict == (False, False)
     assert result.loose == (False, False)
+
+
+def test_json_feature_metadata_falls_back_to_raw_parquet(monkeypatch):
+    calls = []
+
+    def fake_load_dataset(name, **kwargs):
+        calls.append((name, kwargs))
+        if name == "account/vi-ifeval":
+            raise ValueError("Feature type 'Json' not found. Available feature types: []")
+        return ROWS
+
+    monkeypatch.setattr(v_ifeval, "load_dataset", fake_load_dataset)
+
+    task = VIFEval(
+        dataset_name="account/vi-ifeval",
+        split="test",
+        registry=REGISTRY,
+    )
+
+    assert len(task) == 1
+    assert calls == [
+        ("account/vi-ifeval", {"split": "test"}),
+        (
+            "parquet",
+            {
+                "data_files": {
+                    "test": "hf://datasets/account/vi-ifeval/data/test-*.parquet"
+                },
+                "split": "test",
+            },
+        ),
+    ]
+
+
+def test_other_dataset_load_errors_are_not_hidden(monkeypatch):
+    def fail_load(*args, **kwargs):
+        raise ValueError("bad credentials")
+
+    monkeypatch.setattr(v_ifeval, "load_dataset", fail_load)
+
+    try:
+        VIFEval(dataset_name="private/vi-ifeval", registry=REGISTRY)
+    except ValueError as error:
+        assert str(error) == "bad credentials"
+    else:
+        raise AssertionError("Expected the original dataset loading error")
