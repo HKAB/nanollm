@@ -14,6 +14,7 @@ from datasets import load_dataset
 
 DATASET_NAME = "hkab/abmusu"
 EVAL_SPLIT = "validation"
+MAX_NEW_TOKENS = 384
 SPLITS = {"train", "validation", "test"}
 _WORD_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
 
@@ -95,11 +96,11 @@ class AbMusu:
     """AbMusu evaluation on validation, the only official labeled eval split."""
 
     eval_type = "summarization"
+    max_new_tokens = MAX_NEW_TOKENS
 
     def __init__(
         self,
         *,
-        dataset_name: str = DATASET_NAME,
         split: str = EVAL_SPLIT,
         dataset: Any | None = None,
         limit: int | None = None,
@@ -110,7 +111,7 @@ class AbMusu:
             raise ValueError(f"split must be one of {sorted(SPLITS)}, got {split!r}")
         if limit is not None and limit < 0:
             raise ValueError("limit must be non-negative or None")
-        ds = dataset if dataset is not None else load_dataset(dataset_name, split=split)
+        ds = dataset if dataset is not None else load_dataset(DATASET_NAME, split=split)
         if shuffle:
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed=seed)
@@ -122,7 +123,7 @@ class AbMusu:
                 ds = ds.select(range(min(limit, len(ds))))
             else:
                 ds = ds[:limit]
-        self.dataset_name = dataset_name
+        self.dataset_name = DATASET_NAME
         self.split = split
         self.ds = ds
 

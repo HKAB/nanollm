@@ -10,6 +10,7 @@ from datasets import load_dataset
 
 DATASET_NAME = "uitnlp/ViANLI"
 EVAL_SPLIT = "test"
+MAX_NEW_TOKENS = 16
 LABELS = ("entailment", "neutral", "contradiction")
 
 
@@ -30,6 +31,7 @@ class ViANLI:
     """Answer-only three-way NLI evaluation fixed to the official test split."""
 
     eval_type = "generative_classification"
+    max_new_tokens = MAX_NEW_TOKENS
     primary_metric = "accuracy"
     labels = LABELS
     split = EVAL_SPLIT

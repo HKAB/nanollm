@@ -9,7 +9,7 @@
 # - If your SFT data is raw messages parquet (not pretokenized), remove --pretokenized.
 
 export WANDB_MODE=offline
-export NANOLLM_BASE_DIR=/mnt/data/users/truongnp5/uv_env/nanollm/.cache/nanollm
+export NANOLLM_CACHE_DIR=/mnt/data/users/truongnp5/uv_env/nanollm/.cache/nanollm
 
 torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.chat_sft -- \
     --run qwen_0.8B_sft \

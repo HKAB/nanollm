@@ -57,17 +57,17 @@ from scripts.chat_eval import run_chat_eval
 # Bounded periodic evaluation: categorical tasks can afford larger subsets;
 # long-form generation gets smaller but still representative samples.
 CHATCORE_TASK_CONFIG = {
-    "GlobalMMLU": {"limit": 500, "baseline": 0.25, "max_new_tokens": 8},
-    "NLR-Causal-Reasoning-vi": {"limit": 500, "baseline": 0.5, "max_new_tokens": 8},
-    "ViANLI": {"limit": 300, "baseline": 1 / 3, "max_new_tokens": 16},
-    "UIT-VSMEC": {"limit": 350, "baseline": 1 / 7, "max_new_tokens": 16},
-    "UIT-VSFC-Sentiment": {"limit": 300, "baseline": 1 / 3, "max_new_tokens": 16},
-    "UIT-ViQuAD-QA": {"limit": 250, "baseline": 0.0, "max_new_tokens": 64},
-    "UIT-ViQuAD-Hallucination": {"limit": 250, "baseline": 0.0, "max_new_tokens": 64},
-    "V-IFEval": {"limit": 500, "baseline": 0.0, "max_new_tokens": 1024},
+    "GlobalMMLU": {"limit": 500, "baseline": 0.25},
+    "NLR-Causal-Reasoning-vi": {"limit": 500, "baseline": 0.5},
+    "ViANLI": {"limit": 300, "baseline": 1 / 3},
+    "UIT-VSMEC": {"limit": 350, "baseline": 1 / 7},
+    "UIT-VSFC-Sentiment": {"limit": 300, "baseline": 1 / 3},
+    "UIT-ViQuAD-QA": {"limit": 250, "baseline": 0.0},
+    "UIT-ViQuAD-Hallucination": {"limit": 250, "baseline": 0.0},
+    "V-IFEval": {"limit": 500, "baseline": 0.0},
     # Validation has only 100 labeled clusters; the 300-example test is unlabeled.
-    "AbMusu": {"limit": 100, "baseline": 0.0, "max_new_tokens": 384},
-    "GSM8K": {"limit": 200, "baseline": 0.0, "max_new_tokens": 256},
+    "AbMusu": {"limit": 100, "baseline": 0.0},
+    "GSM8K": {"limit": 200, "baseline": 0.0},
 }
 
 # -----------------------------------------------------------------------------
@@ -300,18 +300,13 @@ while True:
         task_results = {}
         for task_name, task_config in CHATCORE_TASK_CONFIG.items():
             limit = task_config["limit"]
-            max_new_tokens = task_config["max_new_tokens"]
             acc = run_chat_eval(
                 task_name,
                 model,
                 tokenizer,
                 engine,
                 batch_size=args.device_batch_size,
-                max_new_tokens=max_new_tokens,
                 max_problems=limit,
-                v_ifeval_max_new_tokens=max_new_tokens,
-                abmusu_max_new_tokens=max_new_tokens,
-                viquad_max_new_tokens=max_new_tokens,
                 shuffle=True,
                 seed=42,
             )

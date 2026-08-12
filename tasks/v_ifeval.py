@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import random
 import sys
@@ -13,35 +14,11 @@ from typing import Any, Mapping, Sequence
 from datasets import load_dataset
 
 
-DATASET_NAME = "truongnp5/vi-ifeval"
+DATASET_NAME = "hkab/vi-ifeval"
 EVAL_SPLIT = "test"
+MAX_NEW_TOKENS = 1024
 V_IFEVAL_ENV = "V_IFEVAL_PATH"
 DEFAULT_V_IFEVAL_PATH = Path(".cache/V-IFEval")
-
-
-def _load_eval_dataset(dataset_name: str, split: str) -> Any:
-    """Load a Hub dataset, bypassing incompatible exported feature metadata.
-
-    Some newer Hub datasets describe arbitrary dictionaries with the ``Json``
-    feature.  datasets 4.0.0 cannot deserialize that feature metadata even
-    though its Arrow/Parquet reader can read the underlying values.  Loading
-    the pushed Parquet shard directly avoids the metadata compatibility issue.
-    """
-
-    try:
-        return load_dataset(dataset_name, split=split)
-    except ValueError as error:
-        if "Feature type 'Json' not found" not in str(error):
-            raise
-
-    data_file = f"hf://datasets/{dataset_name}/data/{split}-*.parquet"
-    try:
-        return load_dataset("parquet", data_files={split: data_file}, split=split)
-    except Exception as fallback_error:
-        raise RuntimeError(
-            f"Could not load {dataset_name!r} after bypassing its incompatible "
-            "Json feature metadata"
-        ) from fallback_error
 
 
 @dataclass(frozen=True)
@@ -172,12 +149,12 @@ class VIFEval:
     """The verified 1,134-example Vietnamese V-IFEval benchmark."""
 
     eval_type = "instruction_following"
+    max_new_tokens = MAX_NEW_TOKENS
     split = EVAL_SPLIT
 
     def __init__(
         self,
         *,
-        dataset_name: str = DATASET_NAME,
         split: str = EVAL_SPLIT,
         v_ifeval_path: str | os.PathLike[str] | None = None,
         dataset: Any | None = None,
@@ -185,12 +162,12 @@ class VIFEval:
         shuffle: bool = False,
         seed: int = 42,
     ):
-        self.dataset_name = dataset_name
+        self.dataset_name = DATASET_NAME
         self.split = split
         self.ds = (
             dataset
             if dataset is not None
-            else _load_eval_dataset(dataset_name, split)
+            else load_dataset(DATASET_NAME, split=split)
         )
         if shuffle:
             if hasattr(self.ds, "shuffle"):
@@ -209,6 +186,14 @@ class VIFEval:
         row = dict(self.ds[index])
         instruction_ids = row.get("instruction_id_list")
         kwargs = row.get("kwargs")
+        if isinstance(kwargs, list) and all(isinstance(item, str) for item in kwargs):
+            try:
+                kwargs = [json.loads(item) for item in kwargs]
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"V-IFEval example at index {index} has invalid serialized kwargs"
+                ) from error
+            row["kwargs"] = kwargs
         if not isinstance(row.get("prompt"), str) or not row["prompt"].strip():
             raise ValueError(f"V-IFEval example at index {index} has an invalid prompt")
         if not instruction_ids or len(instruction_ids) != len(kwargs or []):

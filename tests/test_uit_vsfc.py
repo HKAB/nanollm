@@ -41,11 +41,13 @@ def test_task_always_loads_test_split(monkeypatch):
     assert task.split == "test"
 
 
-def test_dataset_mirror_can_be_overridden(monkeypatch):
+def test_dataset_mirror_is_owned_by_task(monkeypatch):
     calls = _patch_dataset(monkeypatch)
-    uit_vsfc.UITVSFCSentiment(dataset_name="account/custom-vsfc")
+    task = uit_vsfc.UITVSFCSentiment()
 
-    assert calls == [("account/custom-vsfc", "test")]
+    assert calls == [("hkab/vietnamese_students_feedback", "test")]
+    assert task.dataset_name == "hkab/vietnamese_students_feedback"
+    assert task.max_new_tokens == 16
 
 
 def test_sentiment_mapping_and_topic_is_ignored(monkeypatch):

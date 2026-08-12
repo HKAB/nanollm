@@ -10,6 +10,7 @@ from datasets import load_dataset
 
 DATASET_NAME = "tridm/UIT-VSMEC"
 EVAL_SPLIT = "test"
+MAX_NEW_TOKENS = 16
 EMOTIONS = (
     "Anger",
     "Disgust",
@@ -40,6 +41,7 @@ class UITVSMEC:
     """
 
     eval_type = "generative_classification"
+    max_new_tokens = MAX_NEW_TOKENS
     primary_metric = "macro_f1"
     labels = EMOTIONS
     emotions = EMOTIONS

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 _LABELS = ("A", "B", "C", "D")
+MAX_NEW_TOKENS = 8
 
 
 def _render_mc(question: str, letters: tuple[str, ...], choices: list[str]) -> str:
@@ -97,6 +98,7 @@ class GlobalMMLU:
     Custom JSONL MMLU-style task compatible with categorical evaluation loops.
     """
     eval_type = "categorical"
+    max_new_tokens = MAX_NEW_TOKENS
     letters = _LABELS
 
     def __init__(

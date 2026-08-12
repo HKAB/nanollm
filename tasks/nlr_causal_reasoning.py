@@ -11,6 +11,7 @@ from datasets import load_dataset
 DATASET_NAME = "aisingapore/NLR-Causal-Reasoning"
 LANGUAGE_CONFIG = "vi"
 EVAL_SPLIT = "eval"
+MAX_NEW_TOKENS = 8
 LABELS = ("A", "B")
 QUESTIONS = ("nguyên nhân", "kết quả")
 
@@ -45,6 +46,7 @@ class NLRCausalReasoningVI:
     """Two-choice causal reasoning on the Vietnamese evaluation split."""
 
     eval_type = "categorical"
+    max_new_tokens = MAX_NEW_TOKENS
     letters = LABELS
     language_config = LANGUAGE_CONFIG
     split = EVAL_SPLIT
@@ -142,4 +144,3 @@ class NLRCausalReasoningVI:
 
     def reward(self, conversation: dict[str, Any], assistant_response: str) -> float:
         return float(self.evaluate(conversation, assistant_response))
-

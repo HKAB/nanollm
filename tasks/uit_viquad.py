@@ -26,6 +26,7 @@ from datasets import load_dataset
 
 
 DATASET_NAME = "taidng/UIT-ViQuAD2.0"
+MAX_NEW_TOKENS = 64
 _SPLITS = {"train", "validation", "test"}
 INSUFFICIENT_CONTEXT_RESPONSE = "Không đủ thông tin để trả lời."
 
@@ -99,6 +100,7 @@ def _render_prompt(context: str, question: str, instruction: str) -> str:
 
 class _UITViQuADBase:
     eval_type = "generative"
+    max_new_tokens = MAX_NEW_TOKENS
 
     def __init__(
         self,

@@ -24,6 +24,7 @@ from datasets import load_dataset
 
 
 GSM_RE = re.compile(r"####\s*(\-?[0-9\.,]+)")
+MAX_NEW_TOKENS = 256
 
 
 def extract_answer(completion: str) -> str | None:
@@ -44,6 +45,7 @@ class GSM8K:
     """GSM8K task compatible with the project's generative evaluation loops."""
 
     eval_type = "generative"
+    max_new_tokens = MAX_NEW_TOKENS
 
     def __init__(
         self,

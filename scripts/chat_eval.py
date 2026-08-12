@@ -23,16 +23,14 @@ from nanollm.common import (
     print0,
 )
 from nanollm.engine import Engine
-from tasks.abmusu import DATASET_NAME as ABMUSU_DATASET_NAME
 from tasks.abmusu import AbMusu
 from tasks.global_mmlu import GlobalMMLU
 from tasks.gsm8k import GSM8K
 from tasks.nlr_causal_reasoning import NLRCausalReasoningVI
 from tasks.uit_viquad import UITViQuADHallucination, UITViQuADQA
-from tasks.uit_vsfc import DATASET_NAME as UIT_VSFC_DATASET_NAME, UITVSFCSentiment
+from tasks.uit_vsfc import UITVSFCSentiment
 from tasks.uit_vsmec import UITVSMEC
 from tasks.vianli import ViANLI
-from tasks.v_ifeval import DATASET_NAME as V_IFEVAL_DATASET_NAME
 from tasks.v_ifeval import VIFEval
 
 # -----------------------------------------------------------------------------
@@ -567,29 +565,25 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 # -----------------------------------------------------------------------------
 
 def run_chat_eval(task_name, model, tokenizer, engine,
-                   batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
-                   max_problems=None, v_ifeval_dataset=V_IFEVAL_DATASET_NAME,
-                   v_ifeval_max_new_tokens=None, abmusu_dataset=ABMUSU_DATASET_NAME,
-                   abmusu_max_new_tokens=512, viquad_max_new_tokens=64,
-                   uit_vsfc_dataset=UIT_VSFC_DATASET_NAME,
+                   batch_size=1, num_samples=1, temperature=0.0, top_k=50,
+                   max_problems=None,
                    shuffle=False, seed=42):
     task_factories = {
         'GlobalMMLU': lambda: GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl', shuffle=shuffle, seed=seed),
         'NLR-Causal-Reasoning-vi': lambda: NLRCausalReasoningVI(shuffle=shuffle, seed=seed),
         'UIT-ViQuAD-Hallucination': lambda: UITViQuADHallucination(split='validation', shuffle=shuffle, seed=seed),
         'UIT-ViQuAD-QA': lambda: UITViQuADQA(split='validation', shuffle=shuffle, seed=seed),
-        'UIT-VSFC-Sentiment': lambda: UITVSFCSentiment(
-            dataset_name=uit_vsfc_dataset, shuffle=shuffle, seed=seed
-        ),
+        'UIT-VSFC-Sentiment': lambda: UITVSFCSentiment(shuffle=shuffle, seed=seed),
         'UIT-VSMEC': lambda: UITVSMEC(shuffle=shuffle, seed=seed),
         'ViANLI': lambda: ViANLI(shuffle=shuffle, seed=seed),
-        'V-IFEval': lambda: VIFEval(dataset_name=v_ifeval_dataset, shuffle=shuffle, seed=seed),
-        'AbMusu': lambda: AbMusu(dataset_name=abmusu_dataset, shuffle=shuffle, seed=seed),
+        'V-IFEval': lambda: VIFEval(shuffle=shuffle, seed=seed),
+        'AbMusu': lambda: AbMusu(shuffle=shuffle, seed=seed),
         'GSM8K': lambda: GSM8K('main', 'test', shuffle=shuffle, seed=seed),
     }
     if task_name not in task_factories:
         raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_factories)}")
     task_object = task_factories[task_name]()
+    max_new_tokens = task_object.max_new_tokens
     if task_object.eval_type == 'generative':
         acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
     elif task_object.eval_type == 'categorical':
@@ -606,19 +600,18 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         )
     elif task_object.eval_type == 'hallucination':
         acc = run_hallucination_eval(
-            task_object, tokenizer, model, engine, num_samples, viquad_max_new_tokens,
+            task_object, tokenizer, model, engine, num_samples, max_new_tokens,
             temperature, top_k, max_problems=max_problems,
         )
     elif task_object.eval_type == 'instruction_following':
-        instruction_max_tokens = v_ifeval_max_new_tokens or max_new_tokens
         acc = run_instruction_following_eval(
-            task_object, tokenizer, model, engine, num_samples, instruction_max_tokens,
+            task_object, tokenizer, model, engine, num_samples, max_new_tokens,
             temperature, top_k, max_problems=max_problems,
         )
     elif task_object.eval_type == 'summarization':
         acc = run_summarization_eval(
             task_object, tokenizer, model, engine, num_samples,
-            abmusu_max_new_tokens, temperature, top_k,
+            max_new_tokens, temperature, top_k,
             max_problems=max_problems,
         )
     else:
@@ -633,25 +626,12 @@ if __name__ == "__main__":
     parser.add_argument('-i', '--source', type=str, required=True, help="Source of the model: sft|rl")
     parser.add_argument('-a', '--task-name', type=str, default=None, help="Task name. Default = all tasks. Use | to split multiple tasks.")
     parser.add_argument('-t', '--temperature', type=float, default=0.0)
-    parser.add_argument('-m', '--max-new-tokens', type=int, default=512)
     parser.add_argument('-n', '--num-samples', type=int, default=1)
     parser.add_argument('-k', '--top-k', type=int, default=50)
     parser.add_argument('-b', '--batch-size', type=int, default=8, help='Batch size for categorical evaluation')
     parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
-    parser.add_argument('--v-ifeval-dataset', default=V_IFEVAL_DATASET_NAME,
-                        help='Hugging Face dataset repo containing data/test.jsonl')
-    parser.add_argument('--v-ifeval-max-new-tokens', type=int, default=2048,
-                        help='V-IFEval response limit (official evaluator uses 2048)')
-    parser.add_argument('--abmusu-dataset', default=ABMUSU_DATASET_NAME,
-                        help='Hugging Face AbMusu dataset repo')
-    parser.add_argument('--abmusu-max-new-tokens', type=int, default=512,
-                        help='Maximum generated tokens for each AbMusu summary')
-    parser.add_argument('--viquad-max-new-tokens', type=int, default=64,
-                        help='Maximum generated tokens for grounded ViQuAD answers')
-    parser.add_argument('--uit-vsfc-dataset', default=UIT_VSFC_DATASET_NAME,
-                        help='Data-only Hugging Face mirror of UIT-VSFC')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
     args = parser.parse_args()
 
@@ -696,16 +676,9 @@ if __name__ == "__main__":
             model, tokenizer, engine,
             batch_size=args.batch_size,
             num_samples=args.num_samples,
-            max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
             max_problems=args.max_problems,
-            v_ifeval_dataset=args.v_ifeval_dataset,
-            v_ifeval_max_new_tokens=args.v_ifeval_max_new_tokens,
-            abmusu_dataset=args.abmusu_dataset,
-            abmusu_max_new_tokens=args.abmusu_max_new_tokens,
-            viquad_max_new_tokens=args.viquad_max_new_tokens,
-            uit_vsfc_dataset=args.uit_vsfc_dataset,
         )
         results[task_name] = acc
         metric_name = {
