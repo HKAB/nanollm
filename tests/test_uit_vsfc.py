@@ -37,7 +37,7 @@ def test_task_always_loads_test_split(monkeypatch):
     calls = _patch_dataset(monkeypatch)
     task = uit_vsfc.UITVSFCSentiment()
 
-    assert calls == [("truongnp5/vietnamese_students_feedback", "test")]
+    assert calls == [("hkab/vietnamese_students_feedback", "test")]
     assert task.split == "test"
 
 

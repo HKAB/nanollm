@@ -12,7 +12,7 @@ from typing import Any, Mapping, Sequence
 from datasets import load_dataset
 
 
-DATASET_NAME = "truongnp5/abmusu"
+DATASET_NAME = "hkab/abmusu"
 EVAL_SPLIT = "validation"
 SPLITS = {"train", "validation", "test"}
 _WORD_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
