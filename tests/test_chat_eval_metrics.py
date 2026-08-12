@@ -43,6 +43,52 @@ class FakeClassificationTask:
         return self.rows[index]
 
 
+class FakeCategoricalTask:
+    def __init__(self):
+        self.rows = [
+            {"messages": [], "letters": ("A", "B"), "answer": "A"},
+            {"messages": [], "letters": ("A", "B"), "answer": "B"},
+        ]
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+    def evaluate(self, conversation, prediction):
+        return prediction == conversation["answer"]
+
+
+def test_categorical_eval_projects_only_answer_positions(monkeypatch):
+    class Tokenizer:
+        def token_to_id(self, token):
+            return 0
+
+        def render_for_completion(self, conversation):
+            return [1, 2] if conversation["answer"] == "A" else [3]
+
+        def encode(self, letter):
+            return [{"A": 4, "B": 5}[letter]]
+
+    class Model(FakeModel):
+        def __call__(self, prompt_ids, *, logit_positions):
+            assert prompt_ids.shape == (2, 2)
+            assert logit_positions.tolist() == [1, 0]
+            logits = torch.zeros(2, 1, 6)
+            logits[0, 0, 4] = 1
+            logits[1, 0, 5] = 1
+            return logits
+
+    monkeypatch.setattr(chat_eval, "get_dist_info", lambda: (False, 0, 0, 1))
+
+    score = chat_eval.run_categorical_eval(
+        FakeCategoricalTask(), Tokenizer(), Model(), batch_size=2
+    )
+
+    assert score == 1.0
+
+
 def test_generated_classification_reports_accuracy_and_macro_f1(monkeypatch):
     monkeypatch.setattr(chat_eval, "get_dist_info", lambda: (False, 0, 0, 1))
     monkeypatch.setattr(chat_eval, "print0", lambda *args, **kwargs: None)

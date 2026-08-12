@@ -61,6 +61,22 @@ class TestVarlenSDPAFallback:
 
 
 class TestFullAttentionModel:
+    def test_selected_logits_match_full_projection(self):
+        torch.manual_seed(0)
+        model = Qwen3_5Model(_full_attn_config()).eval()
+        tokens = torch.tensor([[5, 6, 7], [8, 9, 10]])
+        positions = torch.tensor([2, 1])
+
+        with torch.no_grad():
+            full = model(tokens)
+            selected = model(tokens, logit_positions=positions)
+            last = model(tokens, logit_positions=-1)
+
+        expected = full[torch.arange(2), positions].unsqueeze(1)
+        assert selected.shape == (2, 1, model.config.vocab_size)
+        assert torch.allclose(selected, expected, atol=1e-6, rtol=1e-6)
+        assert torch.allclose(last, full[:, -1:, :], atol=1e-6, rtol=1e-6)
+
     def test_packed_equals_standalone(self):
         torch.manual_seed(0)
         model = Qwen3_5Model(_full_attn_config()).eval()

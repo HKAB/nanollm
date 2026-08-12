@@ -672,8 +672,17 @@ class Qwen3_5Model(nn.Module):
                     torch.nn.init.normal_(m.A_log, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean',
-                cu_seqlens=None, position_ids=None):
+                cu_seqlens=None, position_ids=None, logit_positions=None):
+        """Run the model and optionally project only selected positions.
+
+        ``logit_positions`` does not constrain generation: it only avoids the
+        expensive vocabulary projection for prompt positions whose logits the
+        caller will discard. Pass an integer for one shared position or a
+        ``(B,)`` tensor for one position per batch row.
+        """
         B, T = idx.size()
+        if targets is not None and logit_positions is not None:
+            raise ValueError("logit_positions cannot be used when targets are provided")
         T0 = 0 if kv_cache is None else getattr(kv_cache, 'pos', 0)
         if position_ids is not None:
             # Packed/block-diagonal: per-token RoPE positions that reset per segment.
@@ -699,6 +708,14 @@ class Qwen3_5Model(nn.Module):
                              cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         
         x = self.final_norm(x)
+        if logit_positions is not None:
+            if isinstance(logit_positions, int):
+                x = x[:, logit_positions, :].unsqueeze(1)
+            else:
+                if logit_positions.shape != (B,):
+                    raise ValueError("logit_positions must have shape (batch_size,)")
+                batch_indices = torch.arange(B, device=x.device)
+                x = x[batch_indices, logit_positions].unsqueeze(1)
         logits = self.lm_head(x)
         
         if targets is not None:

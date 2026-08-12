@@ -205,7 +205,12 @@ class Engine:
         kv_model_kwargs = {"num_heads": m.n_kv_groups, "head_dim": m.head_dim, "num_layers": m.n_layers, "config": m}
         kv_cache_prefill = KVCache(batch_size=1, seq_len=len(tokens), device=device, dtype=dtype, **kv_model_kwargs)
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        # The full prompt still passes through every transformer layer. Only
+        # its final hidden state needs the large vocabulary projection to seed
+        # unrestricted autoregressive generation.
+        logits = self.model.forward(
+            ids, kv_cache=kv_cache_prefill, logit_positions=-1
+        )
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for all samples

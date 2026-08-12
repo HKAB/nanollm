@@ -9,6 +9,7 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
 import argparse
+import time
 
 import torch
 import torch.distributed as dist
@@ -25,7 +26,6 @@ from nanollm.common import (
 from nanollm.engine import Engine
 from tasks.abmusu import AbMusu
 from tasks.global_mmlu import GlobalMMLU
-from tasks.gsm8k import GSM8K
 from tasks.nlr_causal_reasoning import NLRCausalReasoningVI
 from tasks.uit_viquad import UITViQuADHallucination, UITViQuADQA
 from tasks.uit_vsfc import UITVSFCSentiment
@@ -495,6 +495,7 @@ def run_summarization_eval(
 # A lot easier because we don't have to sample. Therefore, we can actually go
 # batches at a time and just check the logits for correct answer choices.
 
+@torch.inference_mode()
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
@@ -520,9 +521,12 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         padded_prompt_ids = [ids + [pad_token_id] * (max_length - len(ids)) for ids in prompt_ids]
         prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
 
-        # Get the logits for the whole batch of conversations in parallel (efficiency win here)
-        with torch.no_grad():
-            logits = model(prompt_ids) # (B, T, V)
+        # Run the complete prompts, but project only their answer positions to
+        # the vocabulary. This returns (B, 1, V), not the wasteful (B, T, V).
+        logit_positions = torch.tensor(
+            answer_time_positions, dtype=torch.long, device=device
+        )
+        logits = model(prompt_ids, logit_positions=logit_positions)
 
         # Focus on the available answer on just the letters corresponding to choices
         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
@@ -539,8 +543,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
                     letter_to_id_cache[letter] = encoded_letter[0]
                 letter_ids.append(letter_to_id_cache[letter])
             # focus logits just down to the answer position and the available letters of the answer
-            answer_pos = answer_time_positions[idx]
-            focus_logits = logits[idx, answer_pos, letter_ids]
+            focus_logits = logits[idx, 0, letter_ids]
             # get the argmax letter (the predicted answer)
             argmax_letter_id = focus_logits.argmax(dim=-1).item()
             predicted_letter = letters[argmax_letter_id]
@@ -568,6 +571,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, temperature=0.0, top_k=50,
                    max_problems=None,
                    shuffle=False, seed=42):
+    device = model.get_device()
     task_factories = {
         'GlobalMMLU': lambda: GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl', shuffle=shuffle, seed=seed),
         'NLR-Causal-Reasoning-vi': lambda: NLRCausalReasoningVI(shuffle=shuffle, seed=seed),
@@ -578,10 +582,12 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'ViANLI': lambda: ViANLI(shuffle=shuffle, seed=seed),
         'V-IFEval': lambda: VIFEval(shuffle=shuffle, seed=seed),
         'AbMusu': lambda: AbMusu(shuffle=shuffle, seed=seed),
-        'GSM8K': lambda: GSM8K('main', 'test', shuffle=shuffle, seed=seed),
     }
     if task_name not in task_factories:
         raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_factories)}")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started_at = time.perf_counter()
     task_object = task_factories[task_name]()
     max_new_tokens = task_object.max_new_tokens
     if task_object.eval_type == 'generative':
@@ -616,6 +622,22 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         )
     else:
         raise ValueError(f"Unsupported task evaluation type: {task_object.eval_type}")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started_at
+    evaluated = len(task_object) if max_problems is None else min(
+        len(task_object), max_problems
+    )
+    rate = evaluated / elapsed if elapsed > 0 else float("inf")
+    timing = f"{elapsed:.1f}s, {rate:.2f} examples/s"
+    if device.type == "cuda":
+        allocated_gib = torch.cuda.memory_allocated(device) / (1024**3)
+        process_peak_gib = torch.cuda.max_memory_allocated(device) / (1024**3)
+        timing += (
+            f", allocated {allocated_gib:.2f} GiB, "
+            f"process peak {process_peak_gib:.2f} GiB"
+        )
+    print0(f"Timing {task_name}: {timing}")
     return acc
 
 # -----------------------------------------------------------------------------
@@ -652,7 +674,6 @@ if __name__ == "__main__":
         'ViANLI',
         'V-IFEval',
         'AbMusu',
-        'GSM8K',
     ]
     baseline_accuracies = {
         'GlobalMMLU': 0.25, # multiple choice 1 of 4 => 25%
@@ -664,7 +685,6 @@ if __name__ == "__main__":
         'ViANLI': 1 / 3, # random choice among three NLI relations
         'V-IFEval': 0.0, # no meaningful random instruction-following baseline
         'AbMusu': 0.0, # no meaningful random summarization baseline
-        'GSM8K': 0.0,
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 

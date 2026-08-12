@@ -67,7 +67,6 @@ CHATCORE_TASK_CONFIG = {
     "V-IFEval": {"limit": 500, "baseline": 0.0},
     # Validation has only 100 labeled clusters; the 300-example test is unlabeled.
     "AbMusu": {"limit": 100, "baseline": 0.0},
-    "GSM8K": {"limit": 200, "baseline": 0.0},
 }
 
 # -----------------------------------------------------------------------------
@@ -104,9 +103,16 @@ parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR a
 parser.add_argument("--eval-every", type=int, default=200, help="evaluate val loss every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="tokens to use for val loss evaluation")
 parser.add_argument("--chatcore-every", type=int, default=-1, help="evaluate ChatCORE metric every N steps (-1 = disable)")
+parser.add_argument(
+    "--chatcore-batch-size",
+    type=int,
+    default=32,
+    help="batch size for categorical ChatCORE tasks (independent of training batch size)",
+)
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile")
 args = parser.parse_args()
 assert args.num_iterations > 0, "--num-iterations must be > 0"
+assert args.chatcore_batch_size > 0, "--chatcore-batch-size must be > 0"
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
@@ -305,7 +311,7 @@ while True:
                 model,
                 tokenizer,
                 engine,
-                batch_size=args.device_batch_size,
+                batch_size=args.chatcore_batch_size,
                 max_problems=limit,
                 shuffle=True,
                 seed=42,
