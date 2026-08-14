@@ -306,6 +306,49 @@ def test_multi_sample_diversity():
     )
 
 
+def test_generate_prompts_batches_exact_prefill_lengths_and_ragged_decode():
+    class RecordingModel:
+        def __init__(self):
+            self.config = MockConfig()
+            self._device = torch.device("cpu")
+            self.calls = []
+
+        def get_device(self):
+            return self._device
+
+        def forward(self, ids, kv_cache=None, position_ids=None):
+            before = kv_cache.cache_seqlens.clone()
+            self.calls.append((tuple(ids.shape), before.tolist()))
+            kv_cache.advance(ids.shape[1])
+            logits = torch.full((*ids.shape, 16), -1e9)
+            # Prefill emits token 5; the first decode step emits EOS.
+            token = 5 if not torch.any(before) else EOS_ID
+            vocab_token = 6 if token == EOS_ID else token
+            logits[:, -1, vocab_token] = 1e9
+            return logits
+
+    class SmallTokenizer:
+        def get_eos_token_ids(self):
+            return {6}
+
+    model = RecordingModel()
+    engine = Engine(model, SmallTokenizer())
+    prompts = [[1], [2, 3], [4], [5, 6]]
+    results = engine.generate_prompts(
+        prompts,
+        batch_size=4,
+        max_tokens=3,
+        max_length_delta=4,
+        use_cuda_graphs=False,
+        completion_check_interval=1,
+    )
+
+    assert results == [prompt + [5] for prompt in prompts]
+    assert ((2, 1), [0, 0]) in model.calls
+    assert ((2, 2), [0, 0]) in model.calls
+    assert ((4, 1), [1, 1, 2, 2]) in model.calls
+
+
 def test_eos_stops_generation():
     """<|im_end|> token must end generation for that row."""
     # Script: generate 3 real tokens then im_end

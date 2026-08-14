@@ -155,7 +155,24 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
 
     # SDPA fallback: manually manage KV cache
     B, T_new, H, D = q.shape
-    pos = cache_seqlens[0].item()  # assume uniform position across batch
+    if not torch.all(cache_seqlens == cache_seqlens[0]):
+        # SDPA has no ragged KV-cache primitive. Keep the fallback correct by
+        # handling rows independently; CUDA/FA3 takes the vectorized path.
+        rows = []
+        for row in range(B):
+            rows.append(flash_attn_with_kvcache(
+                q[row:row + 1],
+                k_cache[row:row + 1],
+                v_cache[row:row + 1],
+                k=None if k is None else k[row:row + 1],
+                v=None if v is None else v[row:row + 1],
+                cache_seqlens=cache_seqlens[row:row + 1],
+                causal=causal,
+                window_size=window_size,
+            ))
+        return torch.cat(rows, dim=0)
+
+    pos = cache_seqlens[0].item()
 
     # Insert new k, v into cache (in-place, matching FA3 behavior)
     if k is not None and v is not None:

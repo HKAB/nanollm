@@ -13,17 +13,38 @@ Notes:
 import time
 import sys
 import inspect
+import re
 from collections import deque
 import torch
 import torch.nn.functional as F
 
 from nanollm.checkpoint_manager import load_pretrained_hf
+from nanollm.cache import KVCache
 from nanollm.common import autodetect_device_type, compute_init
 
 # -----------------------------------------------------------------------------
 # Tool call helpers
 
 
+
+
+def parse_tool_call(text):
+    """Parse the engine's compact XML-like tool-call representation."""
+    block = re.search(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
+    if block is None:
+        return None
+    function = re.search(r"<function=([^>\s]+)", block.group(1))
+    if function is None:
+        return None
+    kwargs = {
+        match.group(1): match.group(2).strip()
+        for match in re.finditer(
+            r"<parameter=([^>\s]+)>(.*?)</parameter>",
+            block.group(1),
+            re.DOTALL,
+        )
+    }
+    return function.group(1), kwargs
 
 
 def dispatch_tool(func_name, kwargs, tools):
@@ -57,82 +78,6 @@ def dispatch_tool(func_name, kwargs, tools):
 
 
 # -----------------------------------------------------------------------------
-class KVCache:
-    """
-    KV Cache designed for Flash Attention 3's flash_attn_with_kvcache API.
-
-    Key differences from FA2-style cache:
-    - Tensors are (B, T, H, D) not (B, H, T, D)
-    - FA3 updates the cache in-place during flash_attn_with_kvcache
-    - Position tracked per batch element via cache_seqlens tensor
-    """
-
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype, config=None):
-        self.batch_size = batch_size
-        self.max_seq_len = seq_len
-        self.n_layers = num_layers
-        self.n_heads = num_heads
-        self.head_dim = head_dim
-        # Pre-allocate cache tensors: (n_layers, B, T, H, D)
-        self.k_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-        self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-        # Current sequence length per batch element (FA3 needs int32)
-        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
-        # Linear states
-        self.has_previous_state = False
-        v_head_dim = getattr(config, 'linear_value_head_dim', 128)
-        k_head_dim = getattr(config, 'linear_key_head_dim', 128)
-        n_k_heads = getattr(config, 'linear_num_key_heads', 16)
-        conv_dim = (k_head_dim * n_k_heads) * 2 + (v_head_dim * getattr(config, 'linear_num_value_heads', 16))
-        conv_kernel_size = getattr(config, 'linear_conv_kernel_dim', 4)
-
-        self.linear_conv_states = [torch.zeros(batch_size, conv_dim, conv_kernel_size - 1, device=device, dtype=dtype) for _ in range(num_layers)]
-        self.linear_recurrent_states = [torch.zeros(batch_size, n_k_heads, k_head_dim, v_head_dim, device=device, dtype=dtype) for _ in range(num_layers)]
-
-        # Previous token's normalized embedding for smear (set by model forward pass)
-        self.prev_embedding = None
-
-    def reset(self):
-        """Reset cache to empty state."""
-        self.cache_seqlens.zero_()
-        self.has_previous_state = False
-        for s in self.linear_conv_states: s.zero_()
-        for s in self.linear_recurrent_states: s.zero_()
-        self.prev_embedding = None
-
-    def get_pos(self):
-        """Get current position (assumes all batch elements at same position)."""
-        return self.cache_seqlens[0].item()
-
-    def get_layer_cache(self, layer_idx):
-        """Return (k_cache, v_cache) views for a specific layer."""
-        return self.k_cache[layer_idx], self.v_cache[layer_idx]
-
-    def advance(self, num_tokens):
-        """Advance the cache position by num_tokens."""
-        self.cache_seqlens += num_tokens
-        self.has_previous_state = True
-
-    def prefill(self, other):
-        """
-        Copy cached KV from another cache into this one.
-        Used when we do batch=1 prefill and then want to generate multiple samples in parallel.
-        """
-        assert self.get_pos() == 0, "Cannot prefill a non-empty KV cache"
-        assert self.n_layers == other.n_layers and self.n_heads == other.n_heads and self.head_dim == other.head_dim
-        assert self.max_seq_len >= other.max_seq_len
-        other_pos = other.get_pos()
-        self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
-        self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
-        self.cache_seqlens.fill_(other_pos)
-        self.has_previous_state = other.has_previous_state
-        for i in range(self.n_layers):
-            self.linear_conv_states[i] = other.linear_conv_states[i].expand(self.batch_size, -1, -1).clone()
-            self.linear_recurrent_states[i] = other.linear_recurrent_states[i].expand(self.batch_size, -1, -1, -1).clone()
-
-        if other.prev_embedding is not None:
-            self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
-
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
@@ -154,6 +99,55 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 
 # -----------------------------------------------------------------------------
 
+class _CudaGraphDecode:
+    """Captured one-token decode for one stable batch shape."""
+
+    def __init__(self, engine, source_cache, dtype):
+        device = engine.model.get_device()
+        self.engine = engine
+        self.cache = engine._allocate_cache(
+            source_cache.batch_size, source_cache.max_seq_len, dtype
+        )
+        self.cache.copy_from(source_cache)
+        self.static_ids = torch.zeros(
+            source_cache.batch_size, 1, dtype=torch.long, device=device
+        )
+        self.static_positions = self.cache.cache_seqlens.to(torch.long).unsqueeze(1)
+
+        # Warm third-party kernels and allocator pools on a disposable cache.
+        warm_cache = engine._allocate_cache(
+            source_cache.batch_size, source_cache.max_seq_len, dtype
+        )
+        warm_cache.copy_from(source_cache)
+        warm_stream = torch.cuda.Stream(device=device)
+        warm_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(warm_stream):
+            engine._forward(
+                self.static_ids, warm_cache,
+                position_ids=self.static_positions,
+            )
+        torch.cuda.current_stream(device).wait_stream(warm_stream)
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.static_logits = engine._forward(
+                self.static_ids, self.cache,
+                position_ids=self.static_positions,
+            )
+        # Capture executes once and advances the state. Restore the true prefill.
+        self.cache.copy_from(source_cache)
+
+    def __call__(self, ids):
+        self.static_ids.copy_(ids)
+        self.static_positions.copy_(
+            self.cache.cache_seqlens.to(torch.long).unsqueeze(1)
+        )
+        self.graph.replay()
+        return self.static_logits
+
+
+# -----------------------------------------------------------------------------
+
 class RowState:
     """Per-row state tracking during generation."""
     def __init__(self, current_tokens=None):
@@ -170,6 +164,45 @@ class Engine:
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer
+        try:
+            signature = inspect.signature(model.forward)
+            self._forward_parameters = set(signature.parameters)
+            self._forward_accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            self._forward_parameters = set()
+            self._forward_accepts_kwargs = False
+
+    def _allocate_cache(self, batch_size, seq_len, dtype):
+        """Use a model cache factory when extra inference state is required."""
+        if hasattr(self.model, "create_kv_cache"):
+            return self.model.create_kv_cache(batch_size, seq_len, dtype)
+        config = self.model.config
+        return KVCache(
+            batch_size=batch_size,
+            num_heads=config.n_kv_groups,
+            seq_len=seq_len,
+            head_dim=config.head_dim,
+            num_layers=config.n_layers,
+            device=self.model.get_device(),
+            dtype=dtype,
+        )
+
+    def _forward(self, ids, cache, *, logit_positions=None, position_ids=None):
+        kwargs = {"kv_cache": cache}
+        if logit_positions is not None and (
+            "logit_positions" in self._forward_parameters
+            or self._forward_accepts_kwargs
+        ):
+            kwargs["logit_positions"] = logit_positions
+        if position_ids is not None and (
+            "position_ids" in self._forward_parameters
+            or self._forward_accepts_kwargs
+        ):
+            kwargs["position_ids"] = position_ids
+        return self.model.forward(ids, **kwargs)
 
     @torch.inference_mode()
     def generate(self, tokens, tools=None, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
@@ -201,21 +234,17 @@ class Engine:
         eos_ids = self.tokenizer.get_eos_token_ids()
 
         # 1) Batch-1 prefill of the prompt
-        m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_groups, "head_dim": m.head_dim, "num_layers": m.n_layers, "config": m}
-        kv_cache_prefill = KVCache(batch_size=1, seq_len=len(tokens), device=device, dtype=dtype, **kv_model_kwargs)
+        kv_cache_prefill = self._allocate_cache(1, len(tokens), dtype)
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         # The full prompt still passes through every transformer layer. Only
         # its final hidden state needs the large vocabulary projection to seed
         # unrestricted autoregressive generation.
-        logits = self.model.forward(
-            ids, kv_cache=kv_cache_prefill, logit_positions=-1
-        )
+        logits = self._forward(ids, kv_cache_prefill, logit_positions=-1)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for all samples
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else getattr(self.model.config, 'context_length', 4096)
-        kv_cache_decode = KVCache(batch_size=num_samples, seq_len=kv_length_hint, device=device, dtype=dtype, **kv_model_kwargs)
+        kv_cache_decode = self._allocate_cache(num_samples, kv_length_hint, dtype)
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill
 
@@ -280,7 +309,167 @@ class Engine:
             num_generated += 1
 
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]
+            position_ids = kv_cache_decode.cache_seqlens.to(torch.long).unsqueeze(1)
+            logits = self._forward(
+                ids, kv_cache_decode, position_ids=position_ids
+            )[:, -1, :]
+
+    @torch.inference_mode()
+    def generate_prompts(
+        self,
+        prompts,
+        *,
+        batch_size=32,
+        max_tokens,
+        temperature=0.0,
+        top_k=None,
+        seed=42,
+        max_length_delta=64,
+        use_cuda_graphs=True,
+        completion_check_interval=16,
+    ):
+        """Generate one completion for each independent prompt.
+
+        Equal-length prompts share a prefill call. Nearby lengths are prefetched
+        separately and their populated caches are collated into the same decode
+        batch. This is exact for caches with recurrent state: padding never
+        becomes part of a prompt.
+        """
+        if not prompts:
+            return []
+        if batch_size <= 0 or max_tokens <= 0:
+            raise ValueError("batch_size and max_tokens must be positive")
+        if max_length_delta < 0:
+            raise ValueError("max_length_delta must be non-negative")
+        if any(not p or not isinstance(p[0], int) for p in prompts):
+            raise ValueError("prompts must be non-empty lists of token ids")
+
+        # Ragged decode needs an explicit per-row position interface. Models
+        # without one remain fully supported through exact-length buckets.
+        supports_ragged_positions = (
+            "position_ids" in self._forward_parameters
+            or self._forward_accepts_kwargs
+        )
+        effective_length_delta = (
+            max_length_delta if supports_ragged_positions else 0
+        )
+        ordered = sorted(enumerate(prompts), key=lambda item: len(item[1]))
+        buckets = []
+        bucket = []
+        bucket_min = None
+        for item in ordered:
+            length = len(item[1])
+            if bucket and (
+                len(bucket) >= batch_size
+                or length - bucket_min > effective_length_delta
+            ):
+                buckets.append(bucket)
+                bucket = []
+                bucket_min = None
+            if bucket_min is None:
+                bucket_min = length
+            bucket.append(item)
+        if bucket:
+            buckets.append(bucket)
+
+        outputs = [None] * len(prompts)
+        for bucket_index, items in enumerate(buckets):
+            bucket_prompts = [prompt for _, prompt in items]
+            generated = self._generate_prompt_bucket(
+                bucket_prompts,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                seed=seed + bucket_index,
+                use_cuda_graphs=use_cuda_graphs,
+                completion_check_interval=completion_check_interval,
+            )
+            for (original_index, _), result in zip(items, generated):
+                outputs[original_index] = result
+        return outputs
+
+    def _generate_prompt_bucket(
+        self, prompts, *, max_tokens, temperature, top_k, seed,
+        use_cuda_graphs, completion_check_interval,
+    ):
+        device = self.model.get_device()
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        total_cache_len = max(map(len, prompts)) + max_tokens
+        decode_cache = self._allocate_cache(len(prompts), total_cache_len, dtype)
+        logits_by_row = [None] * len(prompts)
+
+        # Only exact lengths are padded into a tensor. This is both faster and
+        # safe for models whose cache includes convolutional/recurrent state.
+        rows_by_length = {}
+        for row, prompt in enumerate(prompts):
+            rows_by_length.setdefault(len(prompt), []).append(row)
+        for length, rows in rows_by_length.items():
+            prefill_cache = self._allocate_cache(len(rows), length, dtype)
+            ids = torch.tensor(
+                [prompts[row] for row in rows], dtype=torch.long, device=device
+            )
+            group_logits = self._forward(
+                ids, prefill_cache, logit_positions=-1
+            )[:, -1, :]
+            for source_row, target_row in enumerate(rows):
+                decode_cache.copy_row_from(prefill_cache, source_row, target_row)
+                logits_by_row[target_row] = group_logits[source_row]
+
+        logits = torch.stack(logits_by_row)
+        graph_runner = None
+        if use_cuda_graphs and device.type == "cuda":
+            try:
+                graph_runner = _CudaGraphDecode(self, decode_cache, dtype)
+                decode_cache = graph_runner.cache
+            except Exception as exc:
+                # Some third-party recurrent kernels are not graph-capture safe.
+                # Falling back preserves correctness and still keeps batching.
+                if not getattr(self, "_reported_cuda_graph_failure", False):
+                    print(f"CUDA graph decode unavailable; using eager decode: {exc}")
+                    self._reported_cuda_graph_failure = True
+
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+        eos_ids = sorted(self.tokenizer.get_eos_token_ids())
+        eos = torch.tensor(eos_ids, dtype=torch.long, device=device)
+        fallback_eos = eos[0]
+        completed = torch.zeros(len(prompts), dtype=torch.bool, device=device)
+        generated_columns = []
+
+        for step in range(max_tokens):
+            next_ids = sample_next_token(logits, rng, temperature, top_k)[:, 0]
+            next_ids = torch.where(completed, fallback_eos, next_ids)
+            generated_columns.append(next_ids)
+            completed |= (next_ids[:, None] == eos[None, :]).any(dim=1)
+
+            should_check = (
+                (step + 1) % max(1, completion_check_interval) == 0
+                or step + 1 == max_tokens
+            )
+            if should_check and bool(completed.all().item()):
+                break
+            if step + 1 == max_tokens:
+                break
+
+            ids = next_ids.unsqueeze(1)
+            if graph_runner is None:
+                position_ids = decode_cache.cache_seqlens.to(torch.long).unsqueeze(1)
+                logits = self._forward(
+                    ids, decode_cache, position_ids=position_ids
+                )[:, -1, :]
+            else:
+                logits = graph_runner(ids)[:, -1, :]
+
+        generated = torch.stack(generated_columns, dim=1).cpu().tolist()
+        results = []
+        eos_set = set(eos_ids)
+        for prompt, tokens in zip(prompts, generated):
+            stop = next(
+                (index for index, token in enumerate(tokens) if token in eos_set),
+                len(tokens),
+            )
+            results.append(prompt + tokens[:stop])
+        return results
 
     def generate_batch(self, tokens, tools=None, num_samples=1, **kwargs):
         """

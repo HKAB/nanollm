@@ -107,7 +107,12 @@ parser.add_argument(
     "--chatcore-batch-size",
     type=int,
     default=32,
-    help="batch size for categorical ChatCORE tasks (independent of training batch size)",
+    help="evaluation batch size for ChatCORE tasks (independent of training batch size)",
+)
+parser.add_argument(
+    "--chatcore-no-cuda-graphs",
+    action="store_true",
+    help="disable CUDA graphs for batched ChatCORE generation",
 )
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile")
 args = parser.parse_args()
@@ -315,6 +320,7 @@ while True:
                 max_problems=limit,
                 shuffle=True,
                 seed=42,
+                use_cuda_graphs=not args.chatcore_no_cuda_graphs,
             )
             task_results[task_name] = acc
             print0(

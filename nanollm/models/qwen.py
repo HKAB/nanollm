@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
+from nanollm.cache import KVCache
 from nanollm.common import COMPUTE_DTYPE, get_dist_info, print0
 from nanollm.flash_attention import flash_attn
 from nanollm.optim import DistMuonAdamW, MuonAdamW
@@ -45,6 +46,51 @@ class Qwen3_5ModelConfig:
     linear_conv_kernel_dim: int = 4
     hidden_act: str = "silu"
     architectures: list = None
+
+
+class Qwen3_5Cache(KVCache):
+    """KV cache plus the recurrent state required by Qwen3.5 GDN layers."""
+
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers,
+                 device, dtype, config):
+        super().__init__(
+            batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype
+        )
+        key_dim = config.linear_key_head_dim * config.linear_num_key_heads
+        value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+        conv_dim = 2 * key_dim + value_dim
+        conv_width = config.linear_conv_kernel_dim - 1
+        self.linear_conv_states = [
+            torch.zeros(batch_size, conv_dim, conv_width, device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ]
+        self.linear_recurrent_states = [
+            torch.zeros(
+                batch_size,
+                config.linear_num_key_heads,
+                config.linear_key_head_dim,
+                config.linear_value_head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            for _ in range(num_layers)
+        ]
+
+    def reset(self):
+        super().reset()
+        for state in self.linear_conv_states:
+            state.zero_()
+        for state in self.linear_recurrent_states:
+            state.zero_()
+
+    def copy_row_from(self, other, src_row, dst_row):
+        super().copy_row_from(other, src_row, dst_row)
+        for dst, src in zip(self.linear_conv_states, other.linear_conv_states):
+            dst[dst_row].copy_(src[src_row])
+        for dst, src in zip(
+            self.linear_recurrent_states, other.linear_recurrent_states
+        ):
+            dst[dst_row].copy_(src[src_row])
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward."""
@@ -517,6 +563,19 @@ class Qwen3_5Model(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def create_kv_cache(self, batch_size, seq_len, dtype):
+        """Allocate this model's inference state behind the generic cache API."""
+        return Qwen3_5Cache(
+            batch_size=batch_size,
+            num_heads=self.config.n_kv_groups,
+            seq_len=seq_len,
+            head_dim=self.config.head_dim,
+            num_layers=self.config.n_layers,
+            device=self.get_device(),
+            dtype=dtype,
+            config=self.config,
+        )
+
     def estimate_flops(self, global_batch_size, seq_len):
         # Estimation from: https://docs.nvidia.com/nemo/automodel/0.4.0/_modules/nemo_automodel/components/utils/flops_utils.html#qwen3_5_flops
         attention_heads = self.config.n_heads
@@ -683,7 +742,10 @@ class Qwen3_5Model(nn.Module):
         B, T = idx.size()
         if targets is not None and logit_positions is not None:
             raise ValueError("logit_positions cannot be used when targets are provided")
-        T0 = 0 if kv_cache is None else getattr(kv_cache, 'pos', 0)
+        if kv_cache is None or position_ids is not None:
+            T0 = 0
+        else:
+            T0 = kv_cache.get_pos()
         if position_ids is not None:
             # Packed/block-diagonal: per-token RoPE positions that reset per segment.
             cos_sin = (self.cos[position_ids], self.sin[position_ids])
