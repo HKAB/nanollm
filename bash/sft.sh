@@ -32,4 +32,7 @@ torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.chat_sft -- \
     --final-lr-frac 0.05 \
     --eval-every 200 \
     --eval-tokens 1048576 \
+    --save-every 500 \
+    --sample-every 500 \
+    --sample-max-tokens 64 \
     --chatcore-every -1

@@ -114,10 +114,29 @@ parser.add_argument(
     action="store_true",
     help="disable CUDA graphs for batched ChatCORE generation",
 )
+parser.add_argument(
+    "--sample-every",
+    type=int,
+    default=-1,
+    help="generate fixed chat samples every N steps (-1 = disable)",
+)
+parser.add_argument(
+    "--sample-max-tokens",
+    type=int,
+    default=64,
+    help="maximum new tokens for each periodic chat sample",
+)
+parser.add_argument(
+    "--save-every",
+    type=int,
+    default=-1,
+    help="save checkpoints every N steps (-1 = only at end)",
+)
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile")
 args = parser.parse_args()
 assert args.num_iterations > 0, "--num-iterations must be > 0"
 assert args.chatcore_batch_size > 0, "--chatcore-batch-size must be > 0"
+assert args.sample_max_tokens > 0, "--sample-max-tokens must be > 0"
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
@@ -374,8 +393,62 @@ while True:
         })
         model.train()
 
-    # Save checkpoint
-    if last_step:
+    # Periodic qualitative samples. Only rank 0 generates, then all ranks wait
+    # before entering checkpointing or the next distributed optimizer step.
+    should_sample = (
+        args.sample_every > 0
+        and (last_step or (step > 0 and step % args.sample_every == 0))
+    )
+    if should_sample:
+        if master_process:
+            orig_model.eval()
+            sample_conversations = [
+                {
+                    "messages": [
+                        {"role": "user", "content": "Giải thích ngắn gọn vì sao bầu trời có màu xanh."},
+                        {"role": "assistant", "content": ""},
+                    ]
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": "Viết một lời chúc sinh nhật ấm áp bằng tiếng Việt."},
+                        {"role": "assistant", "content": ""},
+                    ]
+                },
+                {
+                    "messages": [
+                        {"role": "user", "content": "If a train travels 120 km in 2 hours, what is its average speed?"},
+                        {"role": "assistant", "content": ""},
+                    ]
+                },
+            ]
+            sample_prompts = [
+                tokenizer.render_for_completion(
+                    conversation, enable_thinking=False
+                )
+                for conversation in sample_conversations
+            ]
+            sample_engine = Engine(orig_model, tokenizer)
+            samples = sample_engine.generate_prompts(
+                sample_prompts,
+                batch_size=len(sample_prompts),
+                max_tokens=args.sample_max_tokens,
+                temperature=0.0,
+                use_cuda_graphs=False,
+            )
+            for index, (prompt, sample) in enumerate(zip(sample_prompts, samples), 1):
+                completion = tokenizer.decode(sample[len(prompt):])
+                print0(f"Step {step:05d} | sample {index}: {completion}")
+            orig_model.train()
+        if ddp:
+            dist.barrier()
+
+    # Save at the end and optionally at a periodic cadence. All ranks
+    # participate because optimizer state is sharded by rank.
+    should_save = last_step or (
+        step > 0 and args.save_every > 0 and step % args.save_every == 0
+    )
+    if should_save:
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", f"step_{step:05d}")
         save_checkpoint(
             checkpoint_dir, step,
@@ -383,9 +456,17 @@ while True:
             optimizer.state_dict(),
             {
                 "step": step,
-                "val_loss": val_loss if "val_loss" in dir() else None,
+                "val_loss": last_val_loss,
                 "model_config": model_config_kwargs,
                 "user_config": user_config,
+                "device_batch_size": args.device_batch_size,
+                "max_seq_len": args.max_seq_len,
+                "total_batch_size": args.total_batch_size,
+                "loop_state": {
+                    "min_val_loss": min_val_loss,
+                    "smooth_loss": smooth_loss,
+                    "total_train_time": total_train_time,
+                },
             },
             tokenizer=tokenizer,
             rank=ddp_rank,
