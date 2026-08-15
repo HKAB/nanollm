@@ -126,6 +126,7 @@ ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type
 master_process = ddp_rank == 0
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+get_current_memory = torch.cuda.memory_allocated if device_type == "cuda" else lambda: 0
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
@@ -276,9 +277,12 @@ def unpack_batch(batch):
 
 x, y, cu_seqlens, position_ids = unpack_batch(next(train_loader))
 min_val_loss    = float("inf")
+last_val_loss   = None
 smooth_loss     = 0.0
 ema_beta        = 0.9
 total_train_time = 0.0
+last_chatcore = None
+last_chatcore_metrics = {}
 step = 0
 
 while True:
@@ -297,10 +301,17 @@ while True:
         tokens_per_eval = args.device_batch_size * args.max_seq_len * ddp_world_size
         eval_steps = max(1, args.eval_tokens // tokens_per_eval)
         val_loss = evaluate_loss(model, val_loader, eval_steps)
+        last_val_loss = val_loss
         print0(f"Step {step:05d} | val loss: {val_loss:.4f}")
         if val_loss < min_val_loss:
             min_val_loss = val_loss
-        wandb_run.log({"step": step, "val/loss": val_loss, "total_training_time": total_train_time})
+        wandb_run.log({
+            "step": step,
+            "val/loss": val_loss,
+            "system/gpu_memory_allocated_gib": get_current_memory() / (1024**3),
+            "system/gpu_memory_peak_gib": get_max_memory() / (1024**3),
+            "total_training_time": total_train_time,
+        })
         model.train()
 
     # ChatCORE metric
@@ -309,6 +320,8 @@ while True:
         engine = Engine(orig_model, tokenizer)
         
         task_results = {}
+        task_metrics = {}
+        task_timings = {}
         for task_name, task_config in CHATCORE_TASK_CONFIG.items():
             limit = task_config["limit"]
             acc = run_chat_eval(
@@ -323,6 +336,8 @@ while True:
                 use_cuda_graphs=not args.chatcore_no_cuda_graphs,
             )
             task_results[task_name] = acc
+            task_metrics[task_name] = dict(engine.last_eval_metrics)
+            task_timings[task_name] = dict(engine.last_eval_timing)
             print0(
                 f"Step {step:05d} | ChatCORE {task_name} "
                 f"(N={limit}): {100 * acc:.2f}%"
@@ -336,12 +351,26 @@ while True:
             baseline = CHATCORE_TASK_CONFIG[task_name]["baseline"]
             centered_scores.append((score - baseline) / (1.0 - baseline))
         chatcore = sum(centered_scores) / len(centered_scores)
+        last_chatcore = chatcore
+        last_chatcore_metrics = task_metrics
 
         print0(f"Step {step:05d} | ChatCORE: {chatcore:.4f}")
+        all_metric_logs = {
+            f"chatcore/{task_name}/{metric_name}": value
+            for task_name, metrics in task_metrics.items()
+            for metric_name, value in metrics.items()
+        }
+        timing_logs = {
+            f"chatcore_timing/{task_name}/{metric_name}": value
+            for task_name, metrics in task_timings.items()
+            for metric_name, value in metrics.items()
+        }
         wandb_run.log({
             "step": step,
             "chatcore": chatcore,
             **{f"chatcore/{task_name}": score for task_name, score in task_results.items()},
+            **all_metric_logs,
+            **timing_logs,
         })
         model.train()
 
@@ -412,7 +441,9 @@ while True:
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_train_time += dt
-    print0(f"step {step:05d}/{args.num_iterations} ({pct_done:.1f}%) | loss: {debiased:.6f} | lrm: {lrm:.3f} | dt: {dt*1000:.1f}ms | tok/s: {tok_per_sec:,} | mfu: {mfu:.1f}% | time: {total_train_time/60:.1f}m")
+    current_memory_gib = get_current_memory() / (1024**3)
+    peak_memory_gib = get_max_memory() / (1024**3)
+    print0(f"step {step:05d}/{args.num_iterations} ({pct_done:.1f}%) | loss: {debiased:.6f} | lrm: {lrm:.3f} | dt: {dt*1000:.1f}ms | tok/s: {tok_per_sec:,} | mfu: {mfu:.1f}% | memory: {current_memory_gib:.2f}/{peak_memory_gib:.2f} GiB | time: {total_train_time/60:.1f}m")
     if step % 10 == 0:
         wandb_run.log({
             "step": step,
@@ -421,6 +452,8 @@ while True:
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
+            "system/gpu_memory_allocated_gib": current_memory_gib,
+            "system/gpu_memory_peak_gib": peak_memory_gib,
             "total_training_time": total_train_time,
         })
 
@@ -441,7 +474,14 @@ from nanollm.report import get_report
 get_report().log(section="SFT", data=[
     user_config,
     {"num_iterations": step, "ddp_world_size": ddp_world_size},
-    {"min_val_loss": min_val_loss},
+    {
+        "min_val_loss": min_val_loss,
+        "final_val_loss": last_val_loss,
+        "ChatCORE": last_chatcore,
+        "ChatCORE task metrics": last_chatcore_metrics,
+        "GPU memory allocated GiB": get_current_memory() / (1024**3),
+        "GPU memory peak GiB": get_max_memory() / (1024**3),
+    },
 ])
 
 wandb_run.finish()

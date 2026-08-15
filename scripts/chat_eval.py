@@ -110,12 +110,6 @@ def run_generative_eval(
         total += 1
         num_passed += int(passed)
 
-        # Logging (overwrite the same line in the console)
-        print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
-
-    # Finish the in-place progress line with a newline before final summary
-    print()
-
     # Aggregate results across all ranks
     if ddp:
         num_passed_tensor = torch.tensor([num_passed], dtype=torch.long, device=device)
@@ -125,11 +119,12 @@ def run_generative_eval(
         num_passed = num_passed_tensor.item()
         total = total_tensor.item()
 
-    print0("=" * 50)
     print0(f"Final: {num_passed}/{total} ({100*num_passed/total:.2f}%)")
 
     # Return the accuracy
-    return num_passed/total
+    accuracy = num_passed / total
+    task_object.metrics = {"accuracy": accuracy}
+    return accuracy
 
 
 def run_generative_classification_eval(
@@ -181,7 +176,6 @@ def run_generative_classification_eval(
         use_cuda_graphs=use_cuda_graphs,
     )
 
-    local_total = local_correct = 0
     for conversation, encoded_prompt, result in zip(
         local_conversations, encoded_prompts, generated
     ):
@@ -189,15 +183,6 @@ def run_generative_classification_eval(
         gold_index = label_to_index[conversation["answer"]]
         prediction_index = label_to_index.get(prediction, len(labels))
         confusion[gold_index, prediction_index] += 1
-        local_total += 1
-        local_correct += int(gold_index == prediction_index)
-        print(
-            f"\r\033[KRank {ddp_rank} | {local_correct}/{local_total} "
-            f"({100 * local_correct / local_total:.2f}%)",
-            end="",
-            flush=True,
-        )
-    print()
 
     if ddp:
         dist.all_reduce(confusion, op=dist.ReduceOp.SUM)
@@ -217,7 +202,6 @@ def run_generative_classification_eval(
         "macro_f1": sum(class_f1) / len(class_f1),
     }
     task_object.metrics = metrics
-    print0("=" * 50)
     print0(f"{type(task_object).__name__} accuracy: {100 * metrics['accuracy']:.2f}%")
     print0(f"{type(task_object).__name__} macro-F1: {100 * metrics['macro_f1']:.2f}%")
     return metrics[task_object.primary_metric]
@@ -275,13 +259,6 @@ def run_extractive_qa_eval(
         totals[0] += 1
         totals[1] += int(score.exact_match)
         totals[2] += score.f1
-        print(
-            f"\r\033[KRank {ddp_rank} | QA F1 "
-            f"{100 * totals[2] / totals[0]:.2f}% ({int(totals[0])} questions)",
-            end="",
-            flush=True,
-        )
-    print()
 
     totals_tensor = torch.tensor(totals, dtype=torch.float64, device=device)
     if ddp:
@@ -289,7 +266,6 @@ def run_extractive_qa_eval(
     total, exact_matches, f1_sum = totals_tensor.tolist()
     metrics = {"exact_match": exact_matches / total, "f1": f1_sum / total}
     task_object.metrics = metrics
-    print0("=" * 50)
     print0(f"UIT-ViQuAD QA exact match: {100 * metrics['exact_match']:.2f}%")
     print0(f"UIT-ViQuAD QA token F1:    {100 * metrics['f1']:.2f}%")
     return metrics["f1"]
@@ -357,13 +333,6 @@ def run_hallucination_eval(
             counts[2] += 1
             counts[3] += int(outcome.correct)
             counts[4] += int(not outcome.refused)
-        print(
-            f"\r\033[KRank {ddp_rank} | grounded accuracy "
-            f"{100 * counts[1] / counts[0]:.2f}% ({counts[0]} questions)",
-            end="",
-            flush=True,
-        )
-    print()
 
     if ddp:
         count_tensor = torch.tensor(counts, dtype=torch.long, device=device)
@@ -395,7 +364,6 @@ def run_hallucination_eval(
         "hallucination_rate": 1.0 - refusal_accuracy if impossible else 0.0,
     }
     task_object.metrics = metrics
-    print0("=" * 50)
     print0(f"UIT-ViQuAD overall accuracy:    {100 * metrics['overall_accuracy']:.2f}%")
     print0(f"UIT-ViQuAD answerable accuracy: {100 * metrics['answerable_accuracy']:.2f}%")
     print0(f"UIT-ViQuAD answerability acc:   {100 * metrics['answerability_accuracy']:.2f}%")
@@ -461,13 +429,6 @@ def run_instruction_following_eval(
         counts[3] += sum(outcome.strict)
         counts[4] += int(outcome.loose_prompt)
         counts[5] += sum(outcome.loose)
-        print(
-            f"\r\033[KRank {ddp_rank} | strict prompts "
-            f"{counts[1]}/{counts[0]} ({100 * counts[1] / counts[0]:.2f}%)",
-            end="",
-            flush=True,
-        )
-    print()
 
     if ddp:
         count_tensor = torch.tensor(counts, dtype=torch.long, device=device)
@@ -482,7 +443,6 @@ def run_instruction_following_eval(
         "loose_instruction_accuracy": loose_instructions / instruction_total,
     }
     task_object.metrics = metrics
-    print0("=" * 50)
     print0(f"V-IFEval strict prompt:      {100 * metrics['strict_prompt_accuracy']:.2f}%")
     print0(f"V-IFEval strict instruction: {100 * metrics['strict_instruction_accuracy']:.2f}%")
     print0(f"V-IFEval loose prompt:       {100 * metrics['loose_prompt_accuracy']:.2f}%")
@@ -557,13 +517,6 @@ def run_summarization_eval(
         precision_sum += score.precision
         recall_sum += score.recall
         f1_sum += score.f1
-        print(
-            f"\r\033[KRank {ddp_rank} | ROUGE-2 F1 "
-            f"{100 * f1_sum / total:.2f}% ({total} clusters)",
-            end="",
-            flush=True,
-        )
-    print()
 
     totals = [total, precision_sum, recall_sum, f1_sum]
     if ddp:
@@ -577,7 +530,6 @@ def run_summarization_eval(
         "rouge2_f1": f1_sum / total,
     }
     task_object.metrics = metrics
-    print0("=" * 50)
     print0(f"AbMusu ROUGE-2 precision: {100 * metrics['rouge2_precision']:.2f}%")
     print0(f"AbMusu ROUGE-2 recall:    {100 * metrics['rouge2_recall']:.2f}%")
     print0(f"AbMusu ROUGE-2 F1:        {100 * metrics['rouge2_f1']:.2f}%")
@@ -684,6 +636,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         total = total_tensor.item()
 
     average = num_passed/total
+    task_object.metrics = {"accuracy": average}
     print0(f"Final: {num_passed}/{total} ({100*average:.2f}%)")
     return average
 
@@ -694,6 +647,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
                    max_problems=None,
                    shuffle=False, seed=42, use_cuda_graphs=True):
     device = model.get_device()
+    engine.last_generation_stats = None
     task_factories = {
         'GlobalMMLU': lambda: GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl', shuffle=shuffle, seed=seed),
         'NLR-Causal-Reasoning-vi': lambda: NLRCausalReasoningVI(shuffle=shuffle, seed=seed),
@@ -768,6 +722,17 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     )
     rate = evaluated / elapsed if elapsed > 0 else float("inf")
     timing = f"{elapsed:.1f}s, {rate:.2f} examples/s"
+    generation_stats = engine.last_generation_stats
+    if generation_stats is not None:
+        generated_tokens_per_second = (
+            generation_stats["generated_tokens"] / elapsed
+            if elapsed > 0 else float("inf")
+        )
+        timing += (
+            f", {generated_tokens_per_second:.1f} generated tok/s, "
+            f"avg prompt/output {generation_stats['average_prompt_tokens']:.0f}/"
+            f"{generation_stats['average_generated_tokens']:.0f} tok"
+        )
     if device.type == "cuda":
         allocated_gib = torch.cuda.memory_allocated(device) / (1024**3)
         process_peak_gib = torch.cuda.max_memory_allocated(device) / (1024**3)
@@ -776,6 +741,22 @@ def run_chat_eval(task_name, model, tokenizer, engine,
             f"process peak {process_peak_gib:.2f} GiB"
         )
     print0(f"Timing {task_name}: {timing}")
+    metrics = dict(getattr(task_object, "metrics", {"accuracy": acc}))
+    engine.last_eval_metrics = metrics
+    engine.last_eval_timing = {
+        "seconds": elapsed,
+        "examples_per_second": rate,
+    }
+    if generation_stats is not None:
+        engine.last_eval_timing.update({
+            **generation_stats,
+            "generated_tokens_per_second": generated_tokens_per_second,
+        })
+    if device.type == "cuda":
+        engine.last_eval_timing.update({
+            "allocated_gib": allocated_gib,
+            "process_peak_gib": process_peak_gib,
+        })
     return acc
 
 # -----------------------------------------------------------------------------
@@ -829,6 +810,7 @@ if __name__ == "__main__":
 
     # Run all the task evaluations sequentially
     results = {}
+    metric_results = {}
     for task_name in task_names:
         acc = run_chat_eval(
             task_name,
@@ -841,6 +823,7 @@ if __name__ == "__main__":
             use_cuda_graphs=not args.no_cuda_graphs,
         )
         results[task_name] = acc
+        metric_results[task_name] = dict(engine.last_eval_metrics)
         metric_name = {
             "AbMusu": "ROUGE-2 F1",
             "UIT-VSMEC": "macro-F1",
@@ -866,6 +849,7 @@ if __name__ == "__main__":
     get_report().log(section="Chat evaluation " + args.source, data=[
         vars(args), # CLI args
         results,
+        {"All task metrics": metric_results},
         chatcore_metric_dict,
     ])
 

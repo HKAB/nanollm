@@ -392,6 +392,17 @@ class Engine:
             )
             for (original_index, _), result in zip(items, generated):
                 outputs[original_index] = result
+        generated_lengths = [
+            len(result) - len(prompt) for prompt, result in zip(prompts, outputs)
+        ]
+        self.last_generation_stats = {
+            "num_prompts": len(prompts),
+            "prompt_tokens": sum(map(len, prompts)),
+            "generated_tokens": sum(generated_lengths),
+            "average_prompt_tokens": sum(map(len, prompts)) / len(prompts),
+            "average_generated_tokens": sum(generated_lengths) / len(prompts),
+            "max_generated_tokens": max(generated_lengths),
+        }
         return outputs
 
     def _generate_prompt_bucket(

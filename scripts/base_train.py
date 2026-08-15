@@ -124,6 +124,7 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+get_current_memory = torch.cuda.memory_allocated if device_type == "cuda" else lambda: 0
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
@@ -440,6 +441,8 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/loss": val_loss,
+            "system/gpu_memory_allocated_gib": get_current_memory() / (1024**3),
+            "system/gpu_memory_peak_gib": get_max_memory() / (1024**3),
         })
         model.train()
 
@@ -452,11 +455,20 @@ while True:
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        raw_core_logs = {
+            f"core/{task_name}/accuracy": value
+            for task_name, value in results["results"].items()
+        }
+        centered_core_logs = {
+            f"core/{task_name}/centered": value
+            for task_name, value in results["centered_results"].items()
+        }
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
+            **raw_core_logs,
+            **centered_core_logs,
         })
         model.train()
 
@@ -573,7 +585,9 @@ while True:
     else:
         eta_str = ""
     epoch = f"ep{dataloader_state_dict['epoch']} pq{dataloader_state_dict['pq_idx']} rg{dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}% | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    current_memory_gib = get_current_memory() / (1024**3)
+    peak_memory_gib = get_max_memory() / (1024**3)
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}% | memory: {current_memory_gib:.2f}/{peak_memory_gib:.2f} GiB | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         lr_log = {f"train/lr_{g['kind']}": g["lr"] for g in optimizer.param_groups}
         log_data = {
@@ -587,7 +601,8 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
-            "system/gpu_memory_mb": get_max_memory() / 1024 / 1024,
+            "system/gpu_memory_allocated_gib": current_memory_gib,
+            "system/gpu_memory_peak_gib": peak_memory_gib,
             **lr_log,
         }
         wandb_run.log(log_data)
@@ -629,10 +644,13 @@ get_report().log(section="Base model training", data=[
         "Minimum validation loss": min_val_loss if val_loss is not None else None,
         "Final validation loss": val_loss,
         "CORE metric estimate": results.get("core_metric", None),
+        "CORE task accuracies": results.get("results", {}),
+        "CORE centered task scores": results.get("centered_results", {}),
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
+        "Current allocated memory": f"{get_current_memory() / 1024 / 1024:.2f}MiB",
     }
 ])
 
