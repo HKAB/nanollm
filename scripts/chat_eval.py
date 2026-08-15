@@ -36,28 +36,69 @@ from tasks.v_ifeval import VIFEval
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
-def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
+
+def _generate_prompt_samples(
+    engine,
+    prompts,
+    *,
+    num_samples,
+    batch_size,
+    max_new_tokens,
+    temperature,
+    top_k,
+    use_cuda_graphs,
+):
+    """Generate N samples per prompt through the shared packed batch engine."""
+    expanded_prompts = [
+        prompt for prompt in prompts for _ in range(num_samples)
+    ]
+    generated = engine.generate_prompts(
+        expanded_prompts,
+        batch_size=batch_size,
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        use_cuda_graphs=use_cuda_graphs,
+    )
+    return [
+        generated[i:i + num_samples]
+        for i in range(0, len(generated), num_samples)
+    ]
+
+
+def run_generative_eval(
+    task_object, tokenizer, model, engine, num_samples, max_new_tokens,
+    temperature, top_k, batch_size=32, use_cuda_graphs=True,
+    max_problems=None,
+):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
 
-    # Run the evaluation
-    num_passed, total = 0, 0
-    for i in range(ddp_rank, num_problems, ddp_world_size):
-        conversation = task_object[i]
+    local_conversations = [
+        task_object[i] for i in range(ddp_rank, num_problems, ddp_world_size)
+    ]
+    encoded_prompts = [
+        tokenizer.render_for_completion(conversation)
+        for conversation in local_conversations
+    ]
+    generated_groups = _generate_prompt_samples(
+        engine,
+        encoded_prompts,
+        num_samples=num_samples,
+        batch_size=batch_size,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        use_cuda_graphs=use_cuda_graphs,
+    )
 
-        # Tokenize the prompt
-        encoded_prompt = tokenizer.render_for_completion(conversation)
-        # Get the completions
-        results, _ = engine.generate_batch(
-            encoded_prompt,
-            num_samples=num_samples,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        )
+    num_passed, total = 0, 0
+    for conversation, encoded_prompt, results in zip(
+        local_conversations, encoded_prompts, generated_groups
+    ):
         # Decode the completions as text
         prefix_length = len(encoded_prompt)
         completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
@@ -100,6 +141,8 @@ def run_generative_classification_eval(
     max_new_tokens,
     temperature,
     top_k,
+    batch_size=32,
+    use_cuda_graphs=True,
     max_problems=None,
 ):
     """Report accuracy and macro-F1 for generated label predictions."""
@@ -120,20 +163,29 @@ def run_generative_classification_eval(
     confusion = torch.zeros(
         (len(labels), len(labels) + 1), dtype=torch.long, device=device
     )
-    local_total = local_correct = 0
-    for i in range(ddp_rank, num_problems, ddp_world_size):
-        conversation = task_object[i]
-        encoded_prompt = tokenizer.render_for_completion(
+    local_conversations = [
+        task_object[i] for i in range(ddp_rank, num_problems, ddp_world_size)
+    ]
+    encoded_prompts = [
+        tokenizer.render_for_completion(
             conversation, enable_thinking=False
         )
-        results, _ = engine.generate_batch(
-            encoded_prompt,
-            num_samples=1,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        )
-        prediction = tokenizer.decode(results[0][len(encoded_prompt):]).strip()
+        for conversation in local_conversations
+    ]
+    generated = engine.generate_prompts(
+        encoded_prompts,
+        batch_size=batch_size,
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        use_cuda_graphs=use_cuda_graphs,
+    )
+
+    local_total = local_correct = 0
+    for conversation, encoded_prompt, result in zip(
+        local_conversations, encoded_prompts, generated
+    ):
+        prediction = tokenizer.decode(result[len(encoded_prompt):]).strip()
         gold_index = label_to_index[conversation["answer"]]
         prediction_index = label_to_index.get(prediction, len(labels))
         confusion[gold_index, prediction_index] += 1
@@ -180,6 +232,8 @@ def run_extractive_qa_eval(
     max_new_tokens,
     temperature,
     top_k,
+    batch_size=32,
+    use_cuda_graphs=True,
     max_problems=None,
 ):
     """Report standard extractive-QA exact match and token F1."""
@@ -194,20 +248,29 @@ def run_extractive_qa_eval(
     if num_problems <= 0:
         raise ValueError("Extractive QA evaluation requires at least one problem")
 
-    totals = [0.0, 0.0, 0.0]  # count, exact matches, token-F1 sum
-    for i in range(ddp_rank, num_problems, ddp_world_size):
-        conversation = task_object[i]
-        encoded_prompt = tokenizer.render_for_completion(
+    local_conversations = [
+        task_object[i] for i in range(ddp_rank, num_problems, ddp_world_size)
+    ]
+    encoded_prompts = [
+        tokenizer.render_for_completion(
             conversation, enable_thinking=False
         )
-        results, _ = engine.generate_batch(
-            encoded_prompt,
-            num_samples=1,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        )
-        completion = tokenizer.decode(results[0][len(encoded_prompt):])
+        for conversation in local_conversations
+    ]
+    generated = engine.generate_prompts(
+        encoded_prompts,
+        batch_size=batch_size,
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        use_cuda_graphs=use_cuda_graphs,
+    )
+
+    totals = [0.0, 0.0, 0.0]  # count, exact matches, token-F1 sum
+    for conversation, encoded_prompt, result in zip(
+        local_conversations, encoded_prompts, generated
+    ):
+        completion = tokenizer.decode(result[len(encoded_prompt):])
         score = task_object.evaluate_details(conversation, completion)
         totals[0] += 1
         totals[1] += int(score.exact_match)
@@ -241,6 +304,8 @@ def run_hallucination_eval(
     max_new_tokens,
     temperature,
     top_k,
+    batch_size=32,
+    use_cuda_graphs=True,
     max_problems=None,
 ):
     """Evaluate grounded QA and exact refusal behavior on UIT-ViQuAD2.0."""
@@ -257,22 +322,31 @@ def run_hallucination_eval(
     if num_problems <= 0:
         raise ValueError("UIT-ViQuAD hallucination evaluation needs at least one problem")
 
+    local_conversations = [
+        task_object[i] for i in range(ddp_rank, num_problems, ddp_world_size)
+    ]
+    encoded_prompts = [
+        tokenizer.render_for_completion(
+            conversation, enable_thinking=False
+        )
+        for conversation in local_conversations
+    ]
+    generated = engine.generate_prompts(
+        encoded_prompts,
+        batch_size=batch_size,
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        use_cuda_graphs=use_cuda_graphs,
+    )
+
     # overall total/correct, answerable total/QA-correct/non-refusal,
     # impossible total/refused.
     counts = [0, 0, 0, 0, 0, 0, 0]
-    for i in range(ddp_rank, num_problems, ddp_world_size):
-        conversation = task_object[i]
-        encoded_prompt = tokenizer.render_for_completion(
-            conversation, enable_thinking=False
-        )
-        results, _ = engine.generate_batch(
-            encoded_prompt,
-            num_samples=1,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        )
-        completion = tokenizer.decode(results[0][len(encoded_prompt):])
+    for conversation, encoded_prompt, result in zip(
+        local_conversations, encoded_prompts, generated
+    ):
+        completion = tokenizer.decode(result[len(encoded_prompt):])
         outcome = task_object.evaluate_details(conversation, completion)
         counts[0] += 1
         counts[1] += int(outcome.correct)
@@ -529,23 +603,49 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     # Run the evaluation
     letter_to_id_cache = {} # many letters will repeat often, let's save the tokenizer some work
     num_passed, total = 0, 0
+    supports_packed_prefill = getattr(model, "supports_packed_prefill", False)
+    if callable(supports_packed_prefill):
+        supports_packed_prefill = supports_packed_prefill()
     for i in range(ddp_rank, num_batches, ddp_world_size):
         i0, i1 = i * batch_size, min((i + 1) * batch_size, num_problems)
 
         # Prepare the batch of problems. They might all be of different length, so we pad/collate them.
         conversations = [task_object[ii] for ii in range(i0, i1)]
         prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations]
-        max_length = max(len(ids) for ids in prompt_ids)
-        answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
-        padded_prompt_ids = [ids + [pad_token_id] * (max_length - len(ids)) for ids in prompt_ids]
-        prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
-
-        # Run the complete prompts, but project only their answer positions to
-        # the vocabulary. This returns (B, 1, V), not the wasteful (B, T, V).
-        logit_positions = torch.tensor(
-            answer_time_positions, dtype=torch.long, device=device
-        )
-        logits = model(prompt_ids, logit_positions=logit_positions)
+        if supports_packed_prefill:
+            lengths = torch.tensor(
+                [len(ids) for ids in prompt_ids], dtype=torch.int32, device=device
+            )
+            cu_seqlens = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+            flat_prompt_ids = [token for ids in prompt_ids for token in ids]
+            packed_ids = torch.tensor(
+                [flat_prompt_ids], dtype=torch.long, device=device
+            )
+            starts = torch.repeat_interleave(cu_seqlens[:-1], lengths)
+            position_ids = (
+                torch.arange(len(flat_prompt_ids), device=device) - starts
+            ).unsqueeze(0)
+            logits = model(
+                packed_ids,
+                cu_seqlens=cu_seqlens,
+                position_ids=position_ids,
+                logit_positions=cu_seqlens[1:].to(torch.long) - 1,
+            )
+        else:
+            max_length = max(len(ids) for ids in prompt_ids)
+            answer_time_positions = [len(ids) - 1 for ids in prompt_ids]
+            padded_prompt_ids = [
+                ids + [pad_token_id] * (max_length - len(ids))
+                for ids in prompt_ids
+            ]
+            prompt_tensor = torch.tensor(
+                padded_prompt_ids, dtype=torch.long, device=device
+            )
+            # Project only answer positions: (B, 1, V), not (B, T, V).
+            logit_positions = torch.tensor(
+                answer_time_positions, dtype=torch.long, device=device
+            )
+            logits = model(prompt_tensor, logit_positions=logit_positions)
 
         # Focus on the available answer on just the letters corresponding to choices
         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
@@ -610,23 +710,36 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     task_object = task_factories[task_name]()
     max_new_tokens = task_object.max_new_tokens
     if task_object.eval_type == 'generative':
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
+        acc = run_generative_eval(
+            task_object, tokenizer, model, engine, num_samples, max_new_tokens,
+            temperature, top_k, batch_size=batch_size,
+            use_cuda_graphs=use_cuda_graphs, max_problems=max_problems,
+        )
     elif task_object.eval_type == 'categorical':
-        acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
+        # The engine owns the eager inference model. During chat_sft, ``model``
+        # may be a dynamic=False compiled training wrapper that should not see
+        # variable-length packed evaluation shapes.
+        acc = run_categorical_eval(
+            engine.model, tokenizer=tokenizer, task_object=task_object,
+            batch_size=batch_size, max_problems=max_problems,
+        )
     elif task_object.eval_type == 'generative_classification':
         acc = run_generative_classification_eval(
             task_object, tokenizer, model, engine, num_samples, max_new_tokens,
-            temperature, top_k, max_problems=max_problems,
+            temperature, top_k, batch_size=batch_size,
+            use_cuda_graphs=use_cuda_graphs, max_problems=max_problems,
         )
     elif task_object.eval_type == 'extractive_qa':
         acc = run_extractive_qa_eval(
             task_object, tokenizer, model, engine, num_samples, max_new_tokens,
-            temperature, top_k, max_problems=max_problems,
+            temperature, top_k, batch_size=batch_size,
+            use_cuda_graphs=use_cuda_graphs, max_problems=max_problems,
         )
     elif task_object.eval_type == 'hallucination':
         acc = run_hallucination_eval(
             task_object, tokenizer, model, engine, num_samples, max_new_tokens,
-            temperature, top_k, max_problems=max_problems,
+            temperature, top_k, batch_size=batch_size,
+            use_cuda_graphs=use_cuda_graphs, max_problems=max_problems,
         )
     elif task_object.eval_type == 'instruction_following':
         acc = run_instruction_following_eval(

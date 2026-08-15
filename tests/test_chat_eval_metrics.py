@@ -28,6 +28,9 @@ class FakeEngine:
     def generate_batch(self, prompt, **kwargs):
         return [[*prompt, next(self.response_ids)]], None
 
+    def generate_prompts(self, prompts, **kwargs):
+        return [[*prompt, next(self.response_ids)] for prompt in prompts]
+
 
 class FakeClassificationTask:
     labels = ("A", "B")
@@ -86,6 +89,39 @@ def test_categorical_eval_projects_only_answer_positions(monkeypatch):
         FakeCategoricalTask(), Tokenizer(), Model(), batch_size=2
     )
 
+    assert score == 1.0
+
+
+def test_categorical_eval_uses_exact_packed_forward_when_supported(monkeypatch):
+    class Tokenizer:
+        def token_to_id(self, token):
+            return 0
+
+        def render_for_completion(self, conversation):
+            return [1, 2] if conversation["answer"] == "A" else [3]
+
+        def encode(self, letter):
+            return [{"A": 4, "B": 5}[letter]]
+
+    class Model(FakeModel):
+        def supports_packed_prefill(self):
+            return True
+
+        def __call__(self, prompt_ids, *, cu_seqlens, position_ids,
+                     logit_positions):
+            assert prompt_ids.tolist() == [[1, 2, 3]]
+            assert cu_seqlens.tolist() == [0, 2, 3]
+            assert position_ids.tolist() == [[0, 1, 0]]
+            assert logit_positions.tolist() == [1, 2]
+            logits = torch.zeros(2, 1, 6)
+            logits[0, 0, 4] = 1
+            logits[1, 0, 5] = 1
+            return logits
+
+    monkeypatch.setattr(chat_eval, "get_dist_info", lambda: (False, 0, 0, 1))
+    score = chat_eval.run_categorical_eval(
+        FakeCategoricalTask(), Tokenizer(), Model(), batch_size=2
+    )
     assert score == 1.0
 
 
