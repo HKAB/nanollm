@@ -4,15 +4,20 @@ Tests for block-diagonal (varlen) attention used by pretokenized SFT.
 Run: python -m pytest tests/test_block_diagonal_attention.py -v
 
 - The varlen SDPA-fallback math and the full-attention model equivalence run on CPU.
-- The hybrid (GatedDeltaNet / FLA cu_seqlens) reset test requires CUDA + fla and is
-  skipped otherwise.
+- The exact hybrid packed-prefill/cache test requires CUDA plus FLA convolution
+  and gated-delta kernels, and is skipped otherwise.
 """
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 
-from nanollm.models.qwen import Qwen3_5Model, Qwen3_5ModelConfig, HAS_FLA
+from nanollm.models.qwen import (
+    HAS_FLA,
+    HAS_FLA_CONV,
+    Qwen3_5Model,
+    Qwen3_5ModelConfig,
+)
 import nanollm.flash_attention as fa
 from nanollm.flash_attention import flash_attn_varlen_func
 
@@ -108,10 +113,10 @@ class TestFullAttentionModel:
         assert torch.allclose(ab[0, len(A):], ba[0, :len(B)], atol=1e-5)
 
 
-@pytest.mark.skipif(not (torch.cuda.is_available() and HAS_FLA),
-                    reason="hybrid GatedDeltaNet cu_seqlens path needs CUDA + fla")
+@pytest.mark.skipif(not (torch.cuda.is_available() and HAS_FLA and HAS_FLA_CONV),
+                    reason="exact hybrid packed prefill needs CUDA + FLA convolution")
 class TestHybridFLAReset:
-    def test_state_resets_at_boundaries(self):
+    def test_packed_prefill_matches_independent_prefill_and_caches(self):
         dev = "cuda"
         cfg = Qwen3_5ModelConfig(
             vocab_size=128, context_length=128, emb_dim=64, n_heads=4, n_layers=4,
@@ -123,21 +128,70 @@ class TestHybridFLAReset:
         )
         torch.manual_seed(0)
         model = Qwen3_5Model(cfg).to(dev).eval()
-        A, B = list(range(5, 25)), list(range(30, 50))  # len 20 each
-        K = 4  # conv kernel reach; deep tokens (>= K from segment start) are conv-leak-free
+        A, B = list(range(5, 25)), list(range(30, 47))
 
-        def run(tokens, segs):
+        def run(tokens, segs, cache_rows):
             idx, cu, pos = _pack(tokens, segs, dev)
+            cache = model.create_kv_cache(cache_rows, 64, torch.bfloat16)
             with torch.no_grad():
-                return model(idx, cu_seqlens=cu, position_ids=pos)
+                logits = model(
+                    idx, kv_cache=cache, cu_seqlens=cu, position_ids=pos
+                )
+            return logits, cache
 
-        packed = run(A + B, [len(A), len(B)])
-        lb = run(B, [len(B)])
-        deep_reset = (packed[0, len(A) + K:] - lb[0, K:]).abs().max().item()
+        packed, packed_cache = run(A + B, [len(A), len(B)], 2)
+        standalone_a, cache_a = run(A, [len(A)], 1)
+        standalone_b, cache_b = run(B, [len(B)], 1)
+
+        torch.testing.assert_close(packed[0, :len(A)], standalone_a[0])
+        torch.testing.assert_close(packed[0, len(A):], standalone_b[0])
+        assert packed_cache.cache_seqlens.tolist() == [len(A), len(B)]
+
+        for packed_state, a_state, b_state in zip(
+            packed_cache.linear_conv_states,
+            cache_a.linear_conv_states,
+            cache_b.linear_conv_states,
+        ):
+            torch.testing.assert_close(packed_state[0], a_state[0])
+            torch.testing.assert_close(packed_state[1], b_state[0])
+        for packed_state, a_state, b_state in zip(
+            packed_cache.linear_recurrent_states,
+            cache_a.linear_recurrent_states,
+            cache_b.linear_recurrent_states,
+        ):
+            torch.testing.assert_close(packed_state[0], a_state[0])
+            torch.testing.assert_close(packed_state[1], b_state[0])
+
+        full_layers = [i for i, kind in enumerate(cfg.layer_types) if kind == "full_attention"]
+        for layer in full_layers:
+            torch.testing.assert_close(
+                packed_cache.k_cache[layer, 0, :len(A)],
+                cache_a.k_cache[layer, 0, :len(A)],
+            )
+            torch.testing.assert_close(
+                packed_cache.k_cache[layer, 1, :len(B)],
+                cache_b.k_cache[layer, 0, :len(B)],
+            )
+            torch.testing.assert_close(
+                packed_cache.v_cache[layer, 0, :len(A)],
+                cache_a.v_cache[layer, 0, :len(A)],
+            )
+            torch.testing.assert_close(
+                packed_cache.v_cache[layer, 1, :len(B)],
+                cache_b.v_cache[layer, 0, :len(B)],
+            )
+
+        next_ids = torch.tensor([[70], [71]], device=dev)
+        next_positions = torch.tensor([[len(A)], [len(B)]], device=dev)
         with torch.no_grad():
-            packed_noreset = model(torch.tensor([A + B], device=dev))  # full causal, no reset
-        deep_noreset = (packed_noreset[0, len(A) + K:] - lb[0, K:]).abs().max().item()
-
-        # With cu_seqlens the recurrent state resets, so deep tokens of B match standalone
-        # far better than without reset (only the accepted conv leak remains).
-        assert deep_reset < deep_noreset / 3.0, (deep_reset, deep_noreset)
+            packed_decode = model(
+                next_ids, kv_cache=packed_cache, position_ids=next_positions
+            )
+            decode_a = model(
+                next_ids[:1], kv_cache=cache_a, position_ids=next_positions[:1]
+            )
+            decode_b = model(
+                next_ids[1:], kv_cache=cache_b, position_ids=next_positions[1:]
+            )
+        torch.testing.assert_close(packed_decode[:1], decode_a)
+        torch.testing.assert_close(packed_decode[1:], decode_b)

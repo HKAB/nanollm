@@ -190,7 +190,8 @@ class Engine:
             dtype=dtype,
         )
 
-    def _forward(self, ids, cache, *, logit_positions=None, position_ids=None):
+    def _forward(self, ids, cache, *, logit_positions=None, position_ids=None,
+                 cu_seqlens=None):
         kwargs = {"kv_cache": cache}
         if logit_positions is not None and (
             "logit_positions" in self._forward_parameters
@@ -202,6 +203,11 @@ class Engine:
             or self._forward_accepts_kwargs
         ):
             kwargs["position_ids"] = position_ids
+        if cu_seqlens is not None and (
+            "cu_seqlens" in self._forward_parameters
+            or self._forward_accepts_kwargs
+        ):
+            kwargs["cu_seqlens"] = cu_seqlens
         return self.model.forward(ids, **kwargs)
 
     @torch.inference_mode()
@@ -330,10 +336,10 @@ class Engine:
     ):
         """Generate one completion for each independent prompt.
 
-        Equal-length prompts share a prefill call. Nearby lengths are prefetched
-        separately and their populated caches are collated into the same decode
-        batch. This is exact for caches with recurrent state: padding never
-        becomes part of a prompt.
+        Models may opt into an exact packed prefill capability. Other models use
+        equal-length prefill groups whose populated caches are collated into one
+        ragged decode batch. Both paths prevent padding or neighboring prompts
+        from entering model-specific recurrent state.
         """
         if not prompts:
             return []
@@ -398,24 +404,53 @@ class Engine:
         decode_cache = self._allocate_cache(len(prompts), total_cache_len, dtype)
         logits_by_row = [None] * len(prompts)
 
-        # Only exact lengths are padded into a tensor. This is both faster and
-        # safe for models whose cache includes convolutional/recurrent state.
-        rows_by_length = {}
-        for row, prompt in enumerate(prompts):
-            rows_by_length.setdefault(len(prompt), []).append(row)
-        for length, rows in rows_by_length.items():
-            prefill_cache = self._allocate_cache(len(rows), length, dtype)
-            ids = torch.tensor(
-                [prompts[row] for row in rows], dtype=torch.long, device=device
-            )
-            group_logits = self._forward(
-                ids, prefill_cache, logit_positions=-1
-            )[:, -1, :]
-            for source_row, target_row in enumerate(rows):
-                decode_cache.copy_row_from(prefill_cache, source_row, target_row)
-                logits_by_row[target_row] = group_logits[source_row]
+        supports_packed_prefill = getattr(
+            self.model, "supports_packed_prefill", False
+        )
+        if callable(supports_packed_prefill):
+            supports_packed_prefill = supports_packed_prefill()
 
-        logits = torch.stack(logits_by_row)
+        if supports_packed_prefill:
+            lengths = torch.tensor(
+                [len(prompt) for prompt in prompts],
+                dtype=torch.int32,
+                device=device,
+            )
+            cu_seqlens = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+            flat_tokens = [token for prompt in prompts for token in prompt]
+            ids = torch.tensor([flat_tokens], dtype=torch.long, device=device)
+            sequence_starts = torch.repeat_interleave(cu_seqlens[:-1], lengths)
+            position_ids = (
+                torch.arange(len(flat_tokens), device=device) - sequence_starts
+            ).unsqueeze(0)
+            # In packed mode these are absolute positions in the flattened row.
+            last_token_positions = cu_seqlens[1:].to(torch.long) - 1
+            logits = self._forward(
+                ids,
+                decode_cache,
+                logit_positions=last_token_positions,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+            )[:, -1, :]
+        else:
+            # Universal exact fallback. Only equal lengths are padded together,
+            # so model-specific recurrent state can never cross prompt borders.
+            rows_by_length = {}
+            for row, prompt in enumerate(prompts):
+                rows_by_length.setdefault(len(prompt), []).append(row)
+            for length, rows in rows_by_length.items():
+                prefill_cache = self._allocate_cache(len(rows), length, dtype)
+                ids = torch.tensor(
+                    [prompts[row] for row in rows], dtype=torch.long, device=device
+                )
+                group_logits = self._forward(
+                    ids, prefill_cache, logit_positions=-1
+                )[:, -1, :]
+                for source_row, target_row in enumerate(rows):
+                    decode_cache.copy_row_from(prefill_cache, source_row, target_row)
+                    logits_by_row[target_row] = group_logits[source_row]
+
+            logits = torch.stack(logits_by_row)
         graph_runner = None
         if use_cuda_graphs and device.type == "cuda":
             try:

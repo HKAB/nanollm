@@ -24,6 +24,13 @@ try:
 except ImportError:
     HAS_FLA = False
 
+try:
+    from fla.modules.convolution import causal_conv1d as _fla_causal_conv1d
+    HAS_FLA_CONV = True
+except ImportError:
+    _fla_causal_conv1d = None
+    HAS_FLA_CONV = False
+
 @dataclass
 class Qwen3_5ModelConfig:
     vocab_size: int = 248320
@@ -67,7 +74,7 @@ class Qwen3_5Cache(KVCache):
         self.linear_recurrent_states = [
             torch.zeros(
                 batch_size,
-                config.linear_num_key_heads,
+                config.linear_num_value_heads,
                 config.linear_key_head_dim,
                 config.linear_value_head_dim,
                 device=device,
@@ -223,16 +230,32 @@ class GroupedQueryAttention(nn.Module):
         keys_new = keys_new.transpose(1, 2)
         values_new = values_new.transpose(1, 2)
 
-        if cache is None and cu_seqlens is not None:
-            # Packed training: block-diagonal (varlen) attention — each conversation
-            # only attends to itself. Flatten (b, T, H, D) -> (b*T, H, D).
+        if cu_seqlens is not None:
+            # Packed block-diagonal attention. During inference the physical batch
+            # is one while the cache has one logical row per packed sequence.
             H, D = queries.shape[2], queries.shape[3]
             q_flat = queries.reshape(b * num_tokens, H, D)
             k_flat = keys_new.reshape(b * num_tokens, keys_new.shape[2], D)
             v_flat = values_new.reshape(b * num_tokens, values_new.shape[2], D)
             context = flash_attn.flash_attn_varlen_func(q_flat, k_flat, v_flat, cu_seqlens, max_seqlen)
             context = context.reshape(b, num_tokens, H, D)
-            next_cache = None
+            if cache is not None:
+                lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                if lengths.numel() != cache.batch_size:
+                    raise ValueError("packed sequence count must match cache batch size")
+                k_cache, v_cache = cache.get_layer_cache(self.layer_idx)
+                cache_rows = torch.repeat_interleave(
+                    torch.arange(cache.batch_size, device=x.device), lengths
+                )
+                flat_positions = torch.arange(b * num_tokens, device=x.device)
+                cache_positions = flat_positions - torch.repeat_interleave(
+                    cu_seqlens[:-1], lengths
+                )
+                k_cache[cache_rows, cache_positions] = k_flat
+                v_cache[cache_rows, cache_positions] = v_flat
+                next_cache = cache
+            else:
+                next_cache = None
         elif cache is None:
             # Training: causal attention with FA3
             context = flash_attn.flash_attn_func(queries, keys_new, values_new, causal=True)
@@ -246,9 +269,6 @@ class GroupedQueryAttention(nn.Module):
                 cache_seqlens=cache.cache_seqlens,
                 causal=True
             )
-            # Advance cache position after the last block processes
-            if self.layer_idx == cache.n_layers - 1:
-                cache.advance(num_tokens)
             next_cache = cache
 
         context = context.contiguous().reshape(b, num_tokens, self.d_out)
@@ -447,12 +467,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        if use_precomputed_states:
+        if cu_seqlens is not None:
+            if not HAS_FLA_CONV:
+                raise RuntimeError(
+                    "Exact packed Qwen GDN prefill requires FLA causal_conv1d"
+                )
+            packed_qkv = mixed_qkv.transpose(1, 2).reshape(
+                1, batch_size * seq_len, self.conv_dim
+            )
+            packed_qkv, final_conv_state = _fla_causal_conv1d(
+                x=packed_qkv,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                output_final_state=cache is not None,
+                cu_seqlens=cu_seqlens.to(torch.long),
+            )
+            mixed_qkv = packed_qkv.reshape(
+                batch_size, seq_len, self.conv_dim
+            ).transpose(1, 2)
+            if cache is not None:
+                target = cache.linear_conv_states[self.layer_idx]
+                target.copy_(final_conv_state[:, :, -target.shape[-1]:])
+        elif use_precomputed_states:
             mixed_qkv = self.causal_conv1d_update(mixed_qkv, conv_state, self.conv1d.weight.squeeze(1), self.conv1d.bias, self.activation)
         else:
             if cache is not None:
-                conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                cache.linear_conv_states[self.layer_idx] = conv_state
+                state_width = conv_state.shape[-1]
+                new_conv_state = F.pad(
+                    mixed_qkv, (state_width - mixed_qkv.shape[-1], 0)
+                )
+                conv_state.copy_(new_conv_state)
             mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
@@ -469,17 +514,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if cu_seqlens is not None:
-            # Packed/block-diagonal: flatten (B, T, ...) -> (1, B*T, ...) and let FLA
-            # reset the recurrent state at each segment boundary via cu_seqlens. The
-            # depthwise conv1d above still mixes a few tokens across segment edges
-            # (accepted leak; conv kernel size is small).
+            # FLA treats the physical batch-one tensor as N logical sequences and
+            # returns one final recurrent state for every cu_seqlens segment.
             q = query.reshape(1, batch_size * seq_len, *query.shape[2:])
             k = key.reshape(1, batch_size * seq_len, *key.shape[2:])
             v = value.reshape(1, batch_size * seq_len, *value.shape[2:])
             g_f = g.reshape(1, batch_size * seq_len, *g.shape[2:])
             beta_f = beta.reshape(1, batch_size * seq_len, *beta.shape[2:])
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                q, k, v, g=g_f, beta=beta_f, initial_state=None, output_final_state=False,
+                q, k, v, g=g_f, beta=beta_f, initial_state=None,
+                output_final_state=cache is not None,
                 use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens.to(torch.long),
             )
             core_attn_out = core_attn_out.reshape(batch_size, seq_len, *core_attn_out.shape[2:])
@@ -492,8 +536,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 query, key, value, g=g, beta=beta, initial_state=recurrent_state, output_final_state=cache is not None, use_qk_l2norm_in_kernel=True
             )
 
-        if cache is not None:
-            cache.linear_recurrent_states[self.layer_idx] = last_recurrent_state
+        if cache is not None and last_recurrent_state is not None:
+            cache.linear_recurrent_states[self.layer_idx].copy_(last_recurrent_state)
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -562,6 +606,10 @@ class Qwen3_5Model(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    def supports_packed_prefill(self):
+        """Whether exact packed inference kernels are usable on this device."""
+        return HAS_FLA and HAS_FLA_CONV and self.get_device().type == "cuda"
 
     def create_kv_cache(self, batch_size, seq_len, dtype):
         """Allocate this model's inference state behind the generic cache API."""
@@ -768,10 +816,25 @@ class Qwen3_5Model(nn.Module):
             else:
                 x, _ = block(x, mask=None, cos=cos_sin[0], sin=cos_sin[1], start_pos=T0, cache=kv_cache,
                              cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+
+        if kv_cache is not None and cu_seqlens is not None:
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
+                device=kv_cache.cache_seqlens.device,
+                dtype=kv_cache.cache_seqlens.dtype,
+            )
+            if lengths.shape != kv_cache.cache_seqlens.shape:
+                raise ValueError("packed sequence count must match cache batch size")
+            kv_cache.cache_seqlens.copy_(lengths)
+            kv_cache.has_previous_state = True
+        elif kv_cache is not None:
+            # Advance once per model call, independent of which layer type is last.
+            kv_cache.advance(T)
         
         x = self.final_norm(x)
         if logit_positions is not None:
-            if isinstance(logit_positions, int):
+            if cu_seqlens is not None and B == 1 and not isinstance(logit_positions, int):
+                x = x[0, logit_positions].unsqueeze(1)
+            elif isinstance(logit_positions, int):
                 x = x[:, logit_positions, :].unsqueeze(1)
             else:
                 if logit_positions.shape != (B,):

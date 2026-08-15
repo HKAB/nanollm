@@ -349,6 +349,64 @@ def test_generate_prompts_batches_exact_prefill_lengths_and_ragged_decode():
     assert ((4, 1), [1, 1, 2, 2]) in model.calls
 
 
+def test_generate_prompts_uses_optional_packed_prefill_capability():
+    class PackedRecordingModel:
+        def __init__(self):
+            self.config = MockConfig()
+            self._device = torch.device("cpu")
+            self.prefill = None
+
+        def get_device(self):
+            return self._device
+
+        def supports_packed_prefill(self):
+            return True
+
+        def forward(self, ids, kv_cache=None, position_ids=None,
+                    cu_seqlens=None, logit_positions=None):
+            logits = torch.full((ids.shape[0], ids.shape[1], 16), -1e9)
+            if cu_seqlens is not None:
+                self.prefill = (
+                    ids.tolist(), position_ids.tolist(), cu_seqlens.tolist(),
+                    logit_positions.tolist(),
+                )
+                lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                kv_cache.cache_seqlens.copy_(lengths)
+                kv_cache.has_previous_state = True
+                selected = torch.full((lengths.numel(), 1, 16), -1e9)
+                selected[:, :, 5] = 1e9
+                return selected
+
+            # First decode after packed prefill emits EOS.
+            logits[:, -1, 6] = 1e9
+            kv_cache.advance(ids.shape[1])
+            return logits
+
+    class SmallTokenizer:
+        def get_eos_token_ids(self):
+            return {6}
+
+    model = PackedRecordingModel()
+    engine = Engine(model, SmallTokenizer())
+    prompts = [[1, 2, 3], [4], [5, 6]]
+    results = engine.generate_prompts(
+        prompts,
+        batch_size=3,
+        max_tokens=3,
+        use_cuda_graphs=False,
+        completion_check_interval=1,
+    )
+
+    assert results == [prompt + [5] for prompt in prompts]
+    # Buckets are length-sorted to keep the following ragged decode compact.
+    assert model.prefill == (
+        [[4, 5, 6, 1, 2, 3]],
+        [[0, 0, 1, 0, 1, 2]],
+        [0, 1, 3, 6],
+        [0, 2, 5],
+    )
+
+
 def test_eos_stops_generation():
     """<|im_end|> token must end generation for that row."""
     # Script: generate 3 real tokens then im_end
