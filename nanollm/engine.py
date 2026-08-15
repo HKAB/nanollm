@@ -416,7 +416,10 @@ class Engine:
                 dtype=torch.int32,
                 device=device,
             )
-            cu_seqlens = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+            cu_seqlens = torch.cat((
+                lengths.new_zeros(1),
+                lengths.cumsum(0, dtype=torch.int32),
+            ))
             flat_tokens = [token for prompt in prompts for token in prompt]
             ids = torch.tensor([flat_tokens], dtype=torch.long, device=device)
             sequence_starts = torch.repeat_interleave(cu_seqlens[:-1], lengths)

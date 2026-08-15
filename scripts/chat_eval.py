@@ -616,7 +616,10 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
             lengths = torch.tensor(
                 [len(ids) for ids in prompt_ids], dtype=torch.int32, device=device
             )
-            cu_seqlens = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+            cu_seqlens = torch.cat((
+                lengths.new_zeros(1),
+                lengths.cumsum(0, dtype=torch.int32),
+            ))
             flat_prompt_ids = [token for ids in prompt_ids for token in ids]
             packed_ids = torch.tensor(
                 [flat_prompt_ids], dtype=torch.long, device=device

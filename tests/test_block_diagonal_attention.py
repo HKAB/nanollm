@@ -64,6 +64,25 @@ class TestVarlenSDPAFallback:
             start += s
         assert torch.allclose(out, ref, atol=1e-5)
 
+    def test_fa3_boundary_normalizes_cu_seqlens_to_int32(self, monkeypatch):
+        captured = {}
+
+        class FakeFA3:
+            @staticmethod
+            def flash_attn_varlen_func(q, k, v, **kwargs):
+                captured.update(kwargs)
+                return q
+
+        monkeypatch.setattr(fa, "_fa3", FakeFA3())
+        monkeypatch.setattr(fa, "USE_FA3", True)
+        q = k = v = torch.randn(3, 1, 4)
+        cu = torch.tensor([0, 2, 3], dtype=torch.int64)
+        out = flash_attn_varlen_func(q, k, v, cu, max_seqlen=2)
+
+        assert out is q
+        assert captured["cu_seqlens_q"].dtype == torch.int32
+        assert captured["cu_seqlens_k"].dtype == torch.int32
+
 
 class TestFullAttentionModel:
     def test_selected_logits_match_full_projection(self):

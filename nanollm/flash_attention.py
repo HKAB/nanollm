@@ -210,6 +210,9 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens, max_seqlen):
         Output tensor of shape (total_tokens, H, D).
     """
     if USE_FA3:
+        # FA3's C++ interface rejects int64 offsets. PyTorch reductions such as
+        # cumsum promote int32 inputs by default, so normalize at this boundary.
+        cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32)
         return _fa3.flash_attn_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
