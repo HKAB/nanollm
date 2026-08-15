@@ -339,7 +339,6 @@ def test_generate_prompts_batches_exact_prefill_lengths_and_ragged_decode():
         batch_size=4,
         max_tokens=3,
         max_length_delta=4,
-        use_cuda_graphs=False,
         completion_check_interval=1,
     )
 
@@ -393,7 +392,6 @@ def test_generate_prompts_uses_optional_packed_prefill_capability():
         prompts,
         batch_size=3,
         max_tokens=3,
-        use_cuda_graphs=False,
         completion_check_interval=1,
     )
 

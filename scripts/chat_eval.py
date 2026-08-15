@@ -46,7 +46,6 @@ def _generate_prompt_samples(
     max_new_tokens,
     temperature,
     top_k,
-    use_cuda_graphs,
 ):
     """Generate N samples per prompt through the shared packed batch engine."""
     expanded_prompts = [
@@ -58,7 +57,6 @@ def _generate_prompt_samples(
         max_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
-        use_cuda_graphs=use_cuda_graphs,
     )
     return [
         generated[i:i + num_samples]
@@ -68,7 +66,7 @@ def _generate_prompt_samples(
 
 def run_generative_eval(
     task_object, tokenizer, model, engine, num_samples, max_new_tokens,
-    temperature, top_k, batch_size=32, use_cuda_graphs=True,
+    temperature, top_k, batch_size=32,
     max_problems=None,
 ):
 
@@ -92,7 +90,6 @@ def run_generative_eval(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
-        use_cuda_graphs=use_cuda_graphs,
     )
 
     num_passed, total = 0, 0
@@ -137,7 +134,6 @@ def run_generative_classification_eval(
     temperature,
     top_k,
     batch_size=32,
-    use_cuda_graphs=True,
     max_problems=None,
 ):
     """Report accuracy and macro-F1 for generated label predictions."""
@@ -173,7 +169,6 @@ def run_generative_classification_eval(
         max_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
-        use_cuda_graphs=use_cuda_graphs,
     )
 
     for conversation, encoded_prompt, result in zip(
@@ -217,7 +212,6 @@ def run_extractive_qa_eval(
     temperature,
     top_k,
     batch_size=32,
-    use_cuda_graphs=True,
     max_problems=None,
 ):
     """Report standard extractive-QA exact match and token F1."""
@@ -247,7 +241,6 @@ def run_extractive_qa_eval(
         max_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
-        use_cuda_graphs=use_cuda_graphs,
     )
 
     totals = [0.0, 0.0, 0.0]  # count, exact matches, token-F1 sum
@@ -281,7 +274,6 @@ def run_hallucination_eval(
     temperature,
     top_k,
     batch_size=32,
-    use_cuda_graphs=True,
     max_problems=None,
 ):
     """Evaluate grounded QA and exact refusal behavior on UIT-ViQuAD2.0."""
@@ -313,7 +305,6 @@ def run_hallucination_eval(
         max_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
-        use_cuda_graphs=use_cuda_graphs,
     )
 
     # overall total/correct, answerable total/QA-correct/non-refusal,
@@ -383,7 +374,6 @@ def run_instruction_following_eval(
     temperature,
     top_k,
     batch_size=32,
-    use_cuda_graphs=True,
     max_problems=None,
 ):
     """Run V-IFEval and aggregate its official strict/loose metrics."""
@@ -412,7 +402,6 @@ def run_instruction_following_eval(
         max_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
-        use_cuda_graphs=use_cuda_graphs,
     )
 
     # prompt total/correct, instruction total/correct, first strict then loose.
@@ -460,7 +449,6 @@ def run_summarization_eval(
     temperature,
     top_k,
     batch_size=32,
-    use_cuda_graphs=True,
     max_problems=None,
 ):
     """Generate one summary per cluster and macro-average ROUGE-2."""
@@ -503,7 +491,6 @@ def run_summarization_eval(
         max_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
-        use_cuda_graphs=use_cuda_graphs,
     )
 
     total = 0
@@ -645,7 +632,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, temperature=0.0, top_k=50,
                    max_problems=None,
-                   shuffle=False, seed=42, use_cuda_graphs=True):
+                   shuffle=False, seed=42):
     device = model.get_device()
     engine.last_generation_stats = None
     task_factories = {
@@ -670,7 +657,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         acc = run_generative_eval(
             task_object, tokenizer, model, engine, num_samples, max_new_tokens,
             temperature, top_k, batch_size=batch_size,
-            use_cuda_graphs=use_cuda_graphs, max_problems=max_problems,
+            max_problems=max_problems,
         )
     elif task_object.eval_type == 'categorical':
         # The engine owns the eager inference model. During chat_sft, ``model``
@@ -684,32 +671,30 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         acc = run_generative_classification_eval(
             task_object, tokenizer, model, engine, num_samples, max_new_tokens,
             temperature, top_k, batch_size=batch_size,
-            use_cuda_graphs=use_cuda_graphs, max_problems=max_problems,
+            max_problems=max_problems,
         )
     elif task_object.eval_type == 'extractive_qa':
         acc = run_extractive_qa_eval(
             task_object, tokenizer, model, engine, num_samples, max_new_tokens,
             temperature, top_k, batch_size=batch_size,
-            use_cuda_graphs=use_cuda_graphs, max_problems=max_problems,
+            max_problems=max_problems,
         )
     elif task_object.eval_type == 'hallucination':
         acc = run_hallucination_eval(
             task_object, tokenizer, model, engine, num_samples, max_new_tokens,
             temperature, top_k, batch_size=batch_size,
-            use_cuda_graphs=use_cuda_graphs, max_problems=max_problems,
+            max_problems=max_problems,
         )
     elif task_object.eval_type == 'instruction_following':
         acc = run_instruction_following_eval(
             task_object, tokenizer, model, engine, num_samples, max_new_tokens,
             temperature, top_k, batch_size=batch_size,
-            use_cuda_graphs=use_cuda_graphs,
             max_problems=max_problems,
         )
     elif task_object.eval_type == 'summarization':
         acc = run_summarization_eval(
             task_object, tokenizer, model, engine, num_samples,
             max_new_tokens, temperature, top_k, batch_size=batch_size,
-            use_cuda_graphs=use_cuda_graphs,
             max_problems=max_problems,
         )
     else:
@@ -770,7 +755,6 @@ if __name__ == "__main__":
     parser.add_argument('-n', '--num-samples', type=int, default=1)
     parser.add_argument('-k', '--top-k', type=int, default=50)
     parser.add_argument('-b', '--batch-size', type=int, default=8, help='Evaluation batch size')
-    parser.add_argument('--no-cuda-graphs', action='store_true', help='Disable CUDA graphs for batched generation')
     parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
@@ -820,7 +804,6 @@ if __name__ == "__main__":
             temperature=args.temperature,
             top_k=args.top_k,
             max_problems=args.max_problems,
-            use_cuda_graphs=not args.no_cuda_graphs,
         )
         results[task_name] = acc
         metric_results[task_name] = dict(engine.last_eval_metrics)

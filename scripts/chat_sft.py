@@ -110,11 +110,6 @@ parser.add_argument(
     help="evaluation batch size for ChatCORE tasks (independent of training batch size)",
 )
 parser.add_argument(
-    "--chatcore-no-cuda-graphs",
-    action="store_true",
-    help="disable CUDA graphs for batched ChatCORE generation",
-)
-parser.add_argument(
     "--sample-every",
     type=int,
     default=-1,
@@ -352,7 +347,6 @@ while True:
                 max_problems=limit,
                 shuffle=True,
                 seed=42,
-                use_cuda_graphs=not args.chatcore_no_cuda_graphs,
             )
             task_results[task_name] = acc
             task_metrics[task_name] = dict(engine.last_eval_metrics)
@@ -434,7 +428,6 @@ while True:
                 batch_size=len(sample_prompts),
                 max_tokens=args.sample_max_tokens,
                 temperature=0.0,
-                use_cuda_graphs=False,
             )
             for index, (prompt, sample) in enumerate(zip(sample_prompts, samples), 1):
                 completion = tokenizer.decode(sample[len(prompt):])

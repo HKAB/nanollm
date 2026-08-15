@@ -99,55 +99,6 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 
 # -----------------------------------------------------------------------------
 
-class _CudaGraphDecode:
-    """Captured one-token decode for one stable batch shape."""
-
-    def __init__(self, engine, source_cache, dtype):
-        device = engine.model.get_device()
-        self.engine = engine
-        self.cache = engine._allocate_cache(
-            source_cache.batch_size, source_cache.max_seq_len, dtype
-        )
-        self.cache.copy_from(source_cache)
-        self.static_ids = torch.zeros(
-            source_cache.batch_size, 1, dtype=torch.long, device=device
-        )
-        self.static_positions = self.cache.cache_seqlens.to(torch.long).unsqueeze(1)
-
-        # Warm third-party kernels and allocator pools on a disposable cache.
-        warm_cache = engine._allocate_cache(
-            source_cache.batch_size, source_cache.max_seq_len, dtype
-        )
-        warm_cache.copy_from(source_cache)
-        warm_stream = torch.cuda.Stream(device=device)
-        warm_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(warm_stream):
-            engine._forward(
-                self.static_ids, warm_cache,
-                position_ids=self.static_positions,
-            )
-        torch.cuda.current_stream(device).wait_stream(warm_stream)
-
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.static_logits = engine._forward(
-                self.static_ids, self.cache,
-                position_ids=self.static_positions,
-            )
-        # Capture executes once and advances the state. Restore the true prefill.
-        self.cache.copy_from(source_cache)
-
-    def __call__(self, ids):
-        self.static_ids.copy_(ids)
-        self.static_positions.copy_(
-            self.cache.cache_seqlens.to(torch.long).unsqueeze(1)
-        )
-        self.graph.replay()
-        return self.static_logits
-
-
-# -----------------------------------------------------------------------------
-
 class RowState:
     """Per-row state tracking during generation."""
     def __init__(self, current_tokens=None):
@@ -331,7 +282,6 @@ class Engine:
         top_k=None,
         seed=42,
         max_length_delta=64,
-        use_cuda_graphs=True,
         completion_check_interval=16,
     ):
         """Generate one completion for each independent prompt.
@@ -387,7 +337,6 @@ class Engine:
                 temperature=temperature,
                 top_k=top_k,
                 seed=seed + bucket_index,
-                use_cuda_graphs=use_cuda_graphs,
                 completion_check_interval=completion_check_interval,
             )
             for (original_index, _), result in zip(items, generated):
@@ -407,7 +356,7 @@ class Engine:
 
     def _generate_prompt_bucket(
         self, prompts, *, max_tokens, temperature, top_k, seed,
-        use_cuda_graphs, completion_check_interval,
+        completion_check_interval,
     ):
         device = self.model.get_device()
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -465,18 +414,6 @@ class Engine:
                     logits_by_row[target_row] = group_logits[source_row]
 
             logits = torch.stack(logits_by_row)
-        graph_runner = None
-        if use_cuda_graphs and device.type == "cuda":
-            try:
-                graph_runner = _CudaGraphDecode(self, decode_cache, dtype)
-                decode_cache = graph_runner.cache
-            except Exception as exc:
-                # Some third-party recurrent kernels are not graph-capture safe.
-                # Falling back preserves correctness and still keeps batching.
-                if not getattr(self, "_reported_cuda_graph_failure", False):
-                    print(f"CUDA graph decode unavailable; using eager decode: {exc}")
-                    self._reported_cuda_graph_failure = True
-
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
         eos_ids = sorted(self.tokenizer.get_eos_token_ids())
@@ -501,13 +438,10 @@ class Engine:
                 break
 
             ids = next_ids.unsqueeze(1)
-            if graph_runner is None:
-                position_ids = decode_cache.cache_seqlens.to(torch.long).unsqueeze(1)
-                logits = self._forward(
-                    ids, decode_cache, position_ids=position_ids
-                )[:, -1, :]
-            else:
-                logits = graph_runner(ids)[:, -1, :]
+            position_ids = decode_cache.cache_seqlens.to(torch.long).unsqueeze(1)
+            logits = self._forward(
+                ids, decode_cache, position_ids=position_ids
+            )[:, -1, :]
 
         generated = torch.stack(generated_columns, dim=1).cpu().tolist()
         results = []
