@@ -720,7 +720,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         # may be a dynamic=False compiled training wrapper that should not see
         # variable-length packed evaluation shapes.
         acc = run_categorical_eval(
-            engine.model, tokenizer=tokenizer, task_object=task_object,
+            task_object=task_object, tokenizer=tokenizer, model=engine.model,
             batch_size=batch_size, max_problems=max_problems,
         )
     elif task_object.eval_type == 'generative_classification':

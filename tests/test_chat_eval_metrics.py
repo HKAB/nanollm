@@ -47,6 +47,9 @@ class FakeClassificationTask:
 
 
 class FakeCategoricalTask:
+    eval_type = "categorical"
+    max_new_tokens = 1
+
     def __init__(self):
         self.rows = [
             {"messages": [], "letters": ("A", "B"), "answer": "A"},
@@ -143,3 +146,45 @@ def test_generated_classification_reports_accuracy_and_macro_f1(monkeypatch):
     assert task.metrics["accuracy"] == pytest.approx(2 / 3)
     assert task.metrics["macro_f1"] == pytest.approx(5 / 6)
     assert score == task.metrics["macro_f1"]
+
+
+def test_run_chat_eval_dispatches_categorical_with_engine_model(monkeypatch):
+    inference_model = FakeModel()
+
+    class Engine:
+        model = inference_model
+
+    monkeypatch.setattr(chat_eval, "GlobalMMLU", lambda *args, **kwargs: FakeCategoricalTask())
+    monkeypatch.setattr(chat_eval, "get_dist_info", lambda: (False, 0, 0, 1))
+    monkeypatch.setattr(chat_eval, "print0", lambda *args, **kwargs: None)
+
+    captured = {}
+
+    def fake_categorical(task_object, tokenizer, model, batch_size,
+                         max_problems=None):
+        captured.update(
+            task=task_object,
+            tokenizer=tokenizer,
+            model=model,
+            batch_size=batch_size,
+            max_problems=max_problems,
+        )
+        return 1.0
+
+    monkeypatch.setattr(chat_eval, "run_categorical_eval", fake_categorical)
+    training_wrapper = FakeModel()
+    tokenizer = object()
+    score = chat_eval.run_chat_eval(
+        "GlobalMMLU",
+        training_wrapper,
+        tokenizer,
+        Engine(),
+        batch_size=7,
+        max_problems=2,
+    )
+
+    assert score == 1.0
+    assert captured["model"] is inference_model
+    assert captured["tokenizer"] is tokenizer
+    assert captured["batch_size"] == 7
+    assert captured["max_problems"] == 2
