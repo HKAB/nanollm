@@ -117,7 +117,9 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if USE_FA3:
+    # FA3 availability is process-global, but callers may still deliberately
+    # run CPU tensors (for example small correctness tests on a GPU server).
+    if USE_FA3 and q.is_cuda:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
@@ -147,7 +149,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if USE_FA3:
+    if USE_FA3 and q.is_cuda:
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size
@@ -209,7 +211,7 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens, max_seqlen):
     Returns:
         Output tensor of shape (total_tokens, H, D).
     """
-    if USE_FA3:
+    if USE_FA3 and q.is_cuda:
         # FA3's C++ interface rejects int64 offsets. PyTorch reductions such as
         # cumsum promote int32 inputs by default, so normalize at this boundary.
         cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32)

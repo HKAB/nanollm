@@ -1,10 +1,24 @@
 import re
 
+import pytest
 import torch
 
+import nanollm.flash_attention as flash_attention
 from nanollm.models.ling import Ling3Model, Ling3ModelConfig
 from nanollm.models.registry import get_model_entry, map_hf_config, map_hf_state_dict
 from nanollm.tokenizers.ling_tokenizer import LingTokenizer
+
+
+@pytest.fixture(autouse=True)
+def force_cpu_attention_fallback():
+    """Keep the tiny CPU tests off CUDA-only FA3 kernels on GPU hosts."""
+    saved_override = flash_attention._override_impl
+    saved_use_fa3 = flash_attention.USE_FA3
+    flash_attention._override_impl = "sdpa"
+    flash_attention.USE_FA3 = False
+    yield
+    flash_attention._override_impl = saved_override
+    flash_attention.USE_FA3 = saved_use_fa3
 
 
 def tiny_config():
