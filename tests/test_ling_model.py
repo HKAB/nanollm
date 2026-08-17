@@ -142,7 +142,11 @@ def test_forward_loss_and_selected_logits():
 def test_cached_decode_matches_full_forward():
     model = make_model()
     tokens = torch.tensor([[1, 2, 3, 4]])
-    cache = model.create_kv_cache(batch_size=1, seq_len=8, dtype=torch.float32)
+    cache = model.create_kv_cache(
+        batch_size=1,
+        seq_len=8,
+        dtype=model.transformer.wte.weight.dtype,
+    )
 
     with torch.no_grad():
         full = model(tokens)
