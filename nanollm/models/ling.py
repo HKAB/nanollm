@@ -7,6 +7,7 @@ PyTorch path is deliberately kept as a correctness and portability fallback.
 """
 
 from dataclasses import dataclass
+from collections import OrderedDict
 
 import torch
 import torch.distributed as dist
@@ -26,6 +27,17 @@ try:
 except ImportError:
     _chunk_kda = _fused_recurrent_kda = None
     HAS_FLA_KDA = False
+
+try:
+    import transformer_engine.pytorch as _te
+    from transformer_engine.pytorch.ops import GroupedLinear as _TEGroupedLinear
+
+    HAS_TRANSFORMER_ENGINE = True
+    TRANSFORMER_ENGINE_IMPORT_ERROR = None
+except Exception as exc:
+    _te = _TEGroupedLinear = None
+    HAS_TRANSFORMER_ENGINE = False
+    TRANSFORMER_ENGINE_IMPORT_ERROR = exc
 
 
 @dataclass
@@ -63,6 +75,7 @@ class Ling3ModelConfig:
     n_group: int = 8
     topk_group: int = 4
     routed_scaling_factor: float = 2.5
+    moe_backend: str = "torch"
     hidden_act: str = "silu"
     pad_token_id: int = 156892
     architectures: list | None = None
@@ -292,20 +305,57 @@ class MoEGate(nn.Module):
 class SparseMoE(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        self.backend = cfg.moe_backend
+        self.num_experts = cfg.num_experts
         self.num_experts_per_tok = cfg.num_experts_per_tok
-        self.experts = nn.ModuleList(
-            FeedForward(cfg, cfg.moe_intermediate_size) for _ in range(cfg.num_experts)
-        )
+        self.intermediate_size = cfg.moe_intermediate_size
+        if self.backend == "transformer_engine":
+            if not HAS_TRANSFORMER_ENGINE:
+                detail = (
+                    f" ({TRANSFORMER_ENGINE_IMPORT_ERROR})"
+                    if TRANSFORMER_ENGINE_IMPORT_ERROR is not None else ""
+                )
+                raise RuntimeError(
+                    "Transformer Engine MoE backend requested but import failed"
+                    f"{detail}. Install it with: uv pip install --no-build-isolation "
+                    "'transformer_engine[pytorch]'"
+                )
+            device = torch.get_default_device()
+            self.experts_gate = _TEGroupedLinear(
+                num_groups=cfg.num_experts,
+                in_features=cfg.emb_dim,
+                out_features=cfg.moe_intermediate_size,
+                bias=False,
+                dtype=COMPUTE_DTYPE,
+                device=device,
+            )
+            self.experts_up = _TEGroupedLinear(
+                num_groups=cfg.num_experts,
+                in_features=cfg.emb_dim,
+                out_features=cfg.moe_intermediate_size,
+                bias=False,
+                dtype=COMPUTE_DTYPE,
+                device=device,
+            )
+            self.experts_down = _TEGroupedLinear(
+                num_groups=cfg.num_experts,
+                in_features=cfg.moe_intermediate_size,
+                out_features=cfg.emb_dim,
+                bias=False,
+                dtype=COMPUTE_DTYPE,
+                device=device,
+            )
+        else:
+            self.experts = nn.ModuleList(
+                FeedForward(cfg, cfg.moe_intermediate_size) for _ in range(cfg.num_experts)
+            )
         self.gate = MoEGate(cfg)
         if cfg.num_shared_experts is not None:
             self.shared_experts = FeedForward(
                 cfg, cfg.moe_shared_expert_intermediate_size * cfg.num_shared_experts
             )
 
-    def forward(self, hidden_states):
-        shape = hidden_states.shape
-        x = hidden_states.reshape(-1, shape[-1])
-        topk_idx, topk_weight = self.gate(hidden_states)
+    def _forward_torch(self, x, topk_idx, topk_weight):
         output = torch.zeros_like(x)
         # index_add keeps this path differentiable and avoids materializing
         # top_k copies of every token at once.
@@ -316,6 +366,40 @@ class SparseMoE(nn.Module):
             expert_out = expert(x.index_select(0, token_idx))
             expert_out = expert_out * topk_weight[token_idx, slot_idx, None]
             output.index_add_(0, token_idx, expert_out)
+        return output
+
+    def _forward_transformer_engine(self, x, topk_idx, topk_weight):
+        flat_experts = topk_idx.reshape(-1)
+        tokens_per_expert = torch.bincount(
+            flat_experts, minlength=self.num_experts
+        ).to(torch.int32)
+        permuted, row_id_map = _te.moe_permute(
+            x,
+            topk_idx.to(torch.int32),
+            num_out_tokens=topk_idx.numel(),
+            map_type="index",
+        )
+        gate = self.experts_gate(permuted, tokens_per_expert)
+        up = self.experts_up(permuted, tokens_per_expert)
+        expert_out = self.experts_down(
+            F.silu(gate) * up, tokens_per_expert
+        )
+        return _te.moe_unpermute(
+            expert_out,
+            row_id_map,
+            merging_probs=topk_weight.float(),
+            restore_shape=x.shape,
+            map_type="index",
+        ).to(x.dtype)
+
+    def forward(self, hidden_states):
+        shape = hidden_states.shape
+        x = hidden_states.reshape(-1, shape[-1])
+        topk_idx, topk_weight = self.gate(hidden_states)
+        if self.backend == "transformer_engine":
+            output = self._forward_transformer_engine(x, topk_idx, topk_weight)
+        else:
+            output = self._forward_torch(x, topk_idx, topk_weight)
         output = output.view(shape)
         if hasattr(self, "shared_experts"):
             output = output + self.shared_experts(hidden_states)
@@ -582,6 +666,14 @@ class TransformerBlock(nn.Module):
 class Ling3Model(nn.Module):
     def __init__(self, config):
         super().__init__()
+        if config.moe_backend == "auto":
+            config.moe_backend = (
+                "transformer_engine" if HAS_TRANSFORMER_ENGINE else "torch"
+            )
+        if config.moe_backend not in {"torch", "transformer_engine"}:
+            raise ValueError(
+                "moe_backend must be one of: auto, torch, transformer_engine"
+            )
         self.config = config
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.emb_dim, padding_idx=config.pad_token_id),
@@ -596,11 +688,27 @@ class Ling3Model(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self.use_gradient_checkpointing = False
         self.logit_softcap = 0.0
+        print0(f"Ling MoE backend: {config.moe_backend}")
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
 
     def enable_gradient_checkpointing(self):
         self.use_gradient_checkpointing = True
+
+    @torch.no_grad()
+    def prepare_for_checkpoint_load(self):
+        """Materialize Transformer Engine runtime state after meta to_empty."""
+        if self.config.moe_backend != "transformer_engine":
+            return
+        for block in self.transformer.h:
+            if not isinstance(block.mlp, SparseMoE):
+                continue
+            for projection in (
+                block.mlp.experts_gate,
+                block.mlp.experts_up,
+                block.mlp.experts_down,
+            ):
+                projection.reset_parameters()
 
     @torch.no_grad()
     def _reset_runtime_buffers(self):
@@ -618,10 +726,77 @@ class Ling3Model(nn.Module):
             if isinstance(module, MoEGate):
                 module.expert_load.zero_()
 
+    def _map_expert_state_to_backend(self, state_dict):
+        if self.config.moe_backend != "transformer_engine":
+            return state_dict
+        mapped = OrderedDict(state_dict)
+        if hasattr(state_dict, "_metadata"):
+            mapped._metadata = state_dict._metadata
+        for layer_idx, block in enumerate(self.transformer.h):
+            if not isinstance(block.mlp, SparseMoE):
+                continue
+            prefix = f"transformer.h.{layer_idx}.mlp."
+            for expert_idx in range(block.mlp.num_experts):
+                replacements = {
+                    f"{prefix}experts.{expert_idx}.gate_proj.weight":
+                        f"{prefix}experts_gate.weight{expert_idx}",
+                    f"{prefix}experts.{expert_idx}.up_proj.weight":
+                        f"{prefix}experts_up.weight{expert_idx}",
+                    f"{prefix}experts.{expert_idx}.down_proj.weight":
+                        f"{prefix}experts_down.weight{expert_idx}",
+                }
+                for source, destination in replacements.items():
+                    if source in mapped:
+                        mapped[destination] = mapped.pop(source)
+        return mapped
+
+    def _map_expert_state_from_backend(self, state_dict):
+        if self.config.moe_backend != "transformer_engine":
+            return state_dict
+        for layer_idx, block in enumerate(self.transformer.h):
+            if not isinstance(block.mlp, SparseMoE):
+                continue
+            prefix = f"transformer.h.{layer_idx}.mlp."
+            for expert_idx in range(block.mlp.num_experts):
+                replacements = {
+                    f"{prefix}experts_gate.weight{expert_idx}":
+                        f"{prefix}experts.{expert_idx}.gate_proj.weight",
+                    f"{prefix}experts_up.weight{expert_idx}":
+                        f"{prefix}experts.{expert_idx}.up_proj.weight",
+                    f"{prefix}experts_down.weight{expert_idx}":
+                        f"{prefix}experts.{expert_idx}.down_proj.weight",
+                }
+                for source, destination in replacements.items():
+                    if source in state_dict:
+                        state_dict[destination] = state_dict.pop(source)
+        for key in [key for key in state_dict if key.endswith("_extra_state")]:
+            state_dict.pop(key)
+        return state_dict
+
+    def state_dict(self, *args, **kwargs):
+        state_dict = super().state_dict(*args, **kwargs)
+        return self._map_expert_state_from_backend(state_dict)
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        backend_state = self._map_expert_state_to_backend(state_dict)
+        # TE GroupedLinear runtime metadata is intentionally not checkpointed.
+        # Validate every real tensor strictly while allowing only its optional
+        # _extra_state entries to be absent.
+        result = super().load_state_dict(backend_state, strict=False, assign=assign)
+        missing = [key for key in result.missing_keys if not key.endswith("_extra_state")]
+        unexpected = [key for key in result.unexpected_keys if not key.endswith("_extra_state")]
+        if strict and (missing or unexpected):
+            messages = []
+            if missing:
+                messages.append(f"Missing key(s): {missing}")
+            if unexpected:
+                messages.append(f"Unexpected key(s): {unexpected}")
+            raise RuntimeError(
+                f"Error(s) in loading state_dict for {type(self).__name__}:\n"
+                + "\n".join(messages)
+            )
         self._reset_runtime_buffers()
-        return result
+        return type(result)(missing, unexpected)
 
     def get_device(self):
         return self.transformer.wte.weight.device
@@ -754,6 +929,16 @@ class Ling3Model(nn.Module):
             if isinstance(module, KimiDeltaAttention):
                 module.A_log.copy_(torch.log(torch.empty_like(module.A_log).uniform_(1, 16)))
                 nn.init.zeros_(module.dt_bias)
+            if isinstance(module, SparseMoE) and module.backend == "transformer_engine":
+                for projection in (
+                    module.experts_gate, module.experts_up, module.experts_down
+                ):
+                    for expert_idx in range(module.num_experts):
+                        nn.init.normal_(
+                            getattr(projection, f"weight{expert_idx}"),
+                            mean=0.0,
+                            std=0.02,
+                        )
         self._reset_runtime_buffers()
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean",

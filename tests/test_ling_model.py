@@ -1,9 +1,12 @@
 import re
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 import nanollm.flash_attention as flash_attention
+import nanollm.models.ling as ling_module
 from nanollm.models.ling import Ling3Model, Ling3ModelConfig
 from nanollm.models.registry import get_model_entry, map_hf_config, map_hf_state_dict
 from nanollm.tokenizers.ling_tokenizer import LingTokenizer
@@ -188,3 +191,94 @@ def test_loss_free_moe_bias_update():
     )
     assert all(torch.count_nonzero(gate.expert_load) == 0 for gate in gates)
     assert not any(key.endswith("expert_load") for key in model.state_dict())
+
+
+def test_transformer_engine_moe_adapter_matches_reference(monkeypatch):
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, num_groups, in_features, out_features, **kwargs):
+            super().__init__()
+            for idx in range(num_groups):
+                self.register_parameter(
+                    f"weight{idx}",
+                    torch.nn.Parameter(torch.empty(out_features, in_features)),
+                )
+
+        def forward(self, x, split_sizes):
+            chunks = torch.split(x, split_sizes.tolist(), dim=0)
+            return torch.cat([
+                torch.nn.functional.linear(chunk, getattr(self, f"weight{idx}"))
+                for idx, chunk in enumerate(chunks)
+            ], dim=0)
+
+    def fake_permute(x, selected_experts, **kwargs):
+        flat_experts = selected_experts.reshape(-1).long()
+        token_ids = torch.arange(x.shape[0]).repeat_interleave(selected_experts.shape[1])
+        order = torch.argsort(flat_experts, stable=True)
+        return x[token_ids[order]], (token_ids[order], order)
+
+    def fake_unpermute(x, row_id_map, merging_probs, restore_shape, **kwargs):
+        token_ids, order = row_id_map
+        weighted = x * merging_probs.reshape(-1)[order, None]
+        output = x.new_zeros(restore_shape)
+        output.index_add_(0, token_ids, weighted)
+        return output
+
+    monkeypatch.setattr(ling_module, "HAS_TRANSFORMER_ENGINE", True)
+    monkeypatch.setattr(ling_module, "_TEGroupedLinear", FakeGroupedLinear)
+    monkeypatch.setattr(
+        ling_module,
+        "_te",
+        SimpleNamespace(moe_permute=fake_permute, moe_unpermute=fake_unpermute),
+    )
+
+    reference = Ling3Model(tiny_config())
+    reference.init_weights()
+    grouped_cfg = replace(tiny_config(), moe_backend="transformer_engine")
+    grouped = Ling3Model(grouped_cfg)
+    grouped.load_state_dict(reference.state_dict(), strict=True, assign=True)
+    reference.eval()
+    grouped.eval()
+
+    hidden_ref = torch.randn(2, 5, grouped_cfg.emb_dim, requires_grad=True)
+    hidden_grouped = hidden_ref.detach().clone().requires_grad_(True)
+    out_ref = reference.transformer.h[1].mlp(hidden_ref)
+    out_grouped = grouped.transformer.h[1].mlp(hidden_grouped)
+
+    assert torch.allclose(out_grouped, out_ref, atol=1e-5, rtol=1e-5)
+    out_ref.sum().backward()
+    out_grouped.sum().backward()
+    assert torch.allclose(hidden_grouped.grad, hidden_ref.grad, atol=1e-5, rtol=1e-5)
+    assert set(grouped.state_dict()) == set(reference.state_dict())
+    assert not any("experts_gate.weight" in key for key in grouped.state_dict())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not ling_module.HAS_TRANSFORMER_ENGINE,
+    reason="requires CUDA and Transformer Engine",
+)
+def test_real_transformer_engine_moe_matches_reference():
+    torch.manual_seed(0)
+    with torch.device("cuda"):
+        reference = Ling3Model(tiny_config())
+        reference.init_weights()
+        grouped = Ling3Model(replace(
+            tiny_config(), moe_backend="transformer_engine"
+        ))
+    grouped.load_state_dict(reference.state_dict(), strict=True, assign=False)
+    reference.eval()
+    grouped.eval()
+
+    hidden_ref = torch.randn(
+        2, 5, grouped.config.emb_dim,
+        device="cuda", dtype=torch.bfloat16, requires_grad=True,
+    )
+    hidden_grouped = hidden_ref.detach().clone().requires_grad_(True)
+    out_ref = reference.transformer.h[1].mlp(hidden_ref)
+    out_grouped = grouped.transformer.h[1].mlp(hidden_grouped)
+
+    assert torch.allclose(out_grouped, out_ref, atol=3e-2, rtol=3e-2)
+    out_ref.float().square().mean().backward()
+    out_grouped.float().square().mean().backward()
+    assert torch.allclose(
+        hidden_grouped.grad, hidden_ref.grad, atol=3e-2, rtol=3e-2
+    )

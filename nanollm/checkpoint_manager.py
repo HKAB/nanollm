@@ -21,6 +21,18 @@ def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
+
+def _set_runtime_moe_backend(config_kwargs, architectures, device, requested=None):
+    """Resolve the optional Ling MoE backend without affecting other models."""
+    if "BailingMoeV3ForCausalLM" not in architectures:
+        return config_kwargs
+    config_kwargs = dict(config_kwargs)
+    backend = requested if requested is not None else config_kwargs.get("moe_backend", "auto")
+    if backend == "auto" and device.type != "cuda":
+        backend = "torch"
+    config_kwargs["moe_backend"] = backend
+    return config_kwargs
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, tokenizer=None, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -75,7 +87,11 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
-    model_config_kwargs = meta_data["model_config"]
+    model_config_kwargs = _set_runtime_moe_backend(
+        meta_data["model_config"],
+        meta_data["model_config"].get("architectures", []),
+        device,
+    )
     log0(f"Building model with config: {model_config_kwargs}")
     
     # Use registry to instantiate model
@@ -89,6 +105,8 @@ def build_model(checkpoint_dir, step, device, phase):
         
     # Load the model state
     model.to_empty(device=device)
+    if hasattr(model, "prepare_for_checkpoint_load"):
+        model.prepare_for_checkpoint_load()
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
@@ -138,11 +156,16 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     architectures = hf_config.get("architectures", [])
     entry = get_model_entry(architectures)
     model_config_kwargs = map_hf_config(hf_config, entry["config_mapper"])
+    model_config_kwargs = _set_runtime_moe_backend(
+        model_config_kwargs, architectures, device, kwargs.get("moe_backend")
+    )
     
     model_config = entry["config_class"](**model_config_kwargs)
     with torch.device("meta"):
         model = entry["model_class"](model_config)
     model.to_empty(device=device)
+    if hasattr(model, "prepare_for_checkpoint_load"):
+        model.prepare_for_checkpoint_load()
     
     st_files = glob.glob(os.path.join(pretrained_dir, "*.safetensors"))
     hf_state_dict = {}
@@ -165,6 +188,8 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     state_dict = {k: v for k, v in state_dict.items() if k in expected_keys}
 
     model.load_state_dict(state_dict, strict=True, assign=True)
+    if hasattr(model.config, "moe_backend"):
+        model_config_kwargs["moe_backend"] = model.config.moe_backend
     if phase == "eval":
         model.eval()
     else:

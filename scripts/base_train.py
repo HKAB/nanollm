@@ -106,6 +106,7 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.2, help="ratio of 
 parser.add_argument("--final-lr-frac", type=float, default=0.1, help="final LR as fraction of initial LR")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute activations during backward to save memory (allows larger --device-batch-size)")
 parser.add_argument("--moe-bias-update-rate", type=float, default=1e-3, help="loss-free MoE expert-bias update rate (Ling default: 1e-3; 0 disables)")
+parser.add_argument("--moe-backend", type=str, default="auto", choices=["auto", "torch", "transformer_engine"], help="Ling routed-expert backend (auto uses Transformer Engine on CUDA when installed)")
 parser.add_argument("--timing-every", type=int, default=0, help="print lightweight CUDA phase/component timings every N training steps (0 disables)")
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging or unsupported hardware)")
 parser.add_argument("--logit-softcap", type=float, default=0.0, help="tanh softcap applied to logits before cross-entropy loss (0 = disabled, 15-30 typical)")
@@ -186,7 +187,12 @@ else:
 
 # Load the pretrained model
 print0(f"Loading pretrained model from: {args.pretrained_model_path}")
-model, tokenizer, meta_data_loaded = load_pretrained_hf(args.pretrained_model_path, device, phase="train")
+model, tokenizer, meta_data_loaded = load_pretrained_hf(
+    args.pretrained_model_path,
+    device,
+    phase="train",
+    moe_backend=args.moe_backend,
+)
 model_config_kwargs = meta_data_loaded["model_config"]
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 
