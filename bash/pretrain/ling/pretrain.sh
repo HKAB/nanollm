@@ -12,6 +12,7 @@ python -m scripts.base_train \
     --wandb-tags "ling,tiny,pretrain" \
     --gradient-checkpointing \
     --moe-bias-update-rate 1e-3 \
+    --no-compile \
     --pretrained-model-path /mnt/data/huggingface/hub/models--inclusionAI--Ling-3.0-tiny/snapshots/a2ee06c0f2de5b171701aee7f73f70a1da75483b/ \
     --dataset-root /mnt/data/users/truongnp5/final_clean_data/vi_en_parquet_v1_pretokenized_ling \
     --max-seq-len 8192 \

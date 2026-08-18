@@ -256,9 +256,29 @@ class MuonAdamW(torch.optim.Optimizer):
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
-        # Stack grads and params (NOTE: this assumes all params have the same shape)
-        stacked_grads = torch.stack([p.grad for p in params])
+        # Sparse MoE experts may receive no tokens, in which case autograd
+        # leaves their gradients as None. Keep a fixed stack shape (important
+        # for the compiled fused kernel), but remember those slots so both the
+        # parameter and its optimizer state can retain PyTorch's usual
+        # grad=None "skip the step" semantics.
+        active_indices = [i for i, param in enumerate(params) if param.grad is not None]
+        if not active_indices:
+            return
+        inactive_indices = [i for i, param in enumerate(params) if param.grad is None]
+        stacked_grads = torch.zeros(
+            num_params, *shape, dtype=dtype, device=device
+        )
+        for i in active_indices:
+            stacked_grads[i].copy_(params[i].grad)
         stacked_params = torch.stack(params)
+
+        inactive_idx = None
+        inactive_momentum = None
+        inactive_second_momentum = None
+        if inactive_indices:
+            inactive_idx = torch.tensor(inactive_indices, device=device)
+            inactive_momentum = momentum_buffer.index_select(0, inactive_idx)
+            inactive_second_momentum = second_momentum_buffer.index_select(0, inactive_idx)
 
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
@@ -280,8 +300,18 @@ class MuonAdamW(torch.optim.Optimizer):
             red_dim,
         )
 
-        # Copy back to original params
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+        # The fused call operates on a fixed-size batch. Undo its momentum
+        # updates for grad=None slots; their updated parameter copies are not
+        # written back below either.
+        if inactive_idx is not None:
+            momentum_buffer.index_copy_(0, inactive_idx, inactive_momentum)
+            second_momentum_buffer.index_copy_(0, inactive_idx, inactive_second_momentum)
+
+        # Copy back only parameters that participated in this optimizer step.
+        torch._foreach_copy_(
+            [params[i] for i in active_indices],
+            [stacked_params[i] for i in active_indices],
+        )
 
     @torch.no_grad()
     def step(self):
