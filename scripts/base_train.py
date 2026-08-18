@@ -22,6 +22,7 @@ from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
+import torch._dynamo.config as dynamo_config
 import torch._inductor.config as inductor_config
 import torch.distributed as dist
 import wandb
@@ -29,6 +30,14 @@ import wandb
 from nanollm.fp8 import Float8LinearConfig, convert_to_float8_training
 
 inductor_config.fx_graph_cache = True  # persist compiled FX graphs to disk
+# The fused Muon step is compiled independently even when --no-compile is used
+# for the model. Ling's heterogeneous matrix shapes plus bounded MoE group
+# chunks require 16 legitimate specializations, exceeding PyTorch's default 8.
+# Keep compatibility with PyTorch versions using either configuration name.
+if hasattr(dynamo_config, "recompile_limit"):
+    dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 32)
+if hasattr(dynamo_config, "cache_size_limit"):
+    dynamo_config.cache_size_limit = max(dynamo_config.cache_size_limit, 32)
 
 from nanollm.checkpoint_manager import (
     load_checkpoint,
