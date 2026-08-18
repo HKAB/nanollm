@@ -106,6 +106,7 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.2, help="ratio of 
 parser.add_argument("--final-lr-frac", type=float, default=0.1, help="final LR as fraction of initial LR")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute activations during backward to save memory (allows larger --device-batch-size)")
 parser.add_argument("--moe-bias-update-rate", type=float, default=1e-3, help="loss-free MoE expert-bias update rate (Ling default: 1e-3; 0 disables)")
+parser.add_argument("--timing-every", type=int, default=0, help="print lightweight CUDA phase/component timings every N training steps (0 disables)")
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging or unsupported hardware)")
 parser.add_argument("--logit-softcap", type=float, default=0.0, help="tanh softcap applied to logits before cross-entropy loss (0 = disabled, 15-30 typical)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
@@ -407,6 +408,57 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # -----------------------------------------------------------------------------
 # Training loop
 
+class CudaComponentTimer:
+    """Time selected Ling modules for one forward without synchronizing."""
+
+    def __init__(self, model):
+        self.events = {}
+        self.handles = []
+        self.pending = {}
+        for name, module in model.named_modules():
+            type_name = type(module).__name__
+            if type_name == "KimiDeltaAttention":
+                category = "kda"
+            elif type_name == "MultiLatentAttention":
+                category = "mla"
+            elif type_name == "SparseMoE":
+                category = "moe"
+            elif type_name == "FeedForward" and name == "transformer.h.0.mlp":
+                category = "dense_mlp"
+            else:
+                continue
+
+            def pre_hook(mod, inputs, category=category):
+                start = torch.cuda.Event(enable_timing=True)
+                start.record()
+                self.pending[id(mod)] = (category, start)
+
+            def post_hook(mod, inputs, output):
+                category, start = self.pending.pop(id(mod))
+                end = torch.cuda.Event(enable_timing=True)
+                end.record()
+                self.events.setdefault(category, []).append((start, end))
+
+            self.handles.append(module.register_forward_pre_hook(pre_hook))
+            self.handles.append(module.register_forward_hook(post_hook))
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def elapsed_ms(self):
+        return {
+            category: sum(start.elapsed_time(end) for start, end in pairs)
+            for category, pairs in self.events.items()
+        }
+
+
+def record_cuda_event():
+    event = torch.cuda.Event(enable_timing=True)
+    event.record()
+    return event
+
 # Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
@@ -536,15 +588,41 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    timing_enabled = (
+        device_type == "cuda"
+        and args.timing_every > 0
+        and step % args.timing_every == 0
+    )
+    timing_events = {
+        "forward": [], "backward": [], "data": [],
+        "grad_clip": [], "optimizer": [],
+    }
+    component_timer = None
     for micro_step in range(grad_accum_steps):
+        if timing_enabled and micro_step == 0:
+            component_timer = CudaComponentTimer(orig_model)
+        phase_start = record_cuda_event() if timing_enabled else None
         loss = model(x, y)
+        if timing_enabled:
+            phase_end = record_cuda_event()
+            timing_events["forward"].append((phase_start, phase_end))
+        if component_timer is not None:
+            component_timer.close()
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        phase_start = record_cuda_event() if timing_enabled else None
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        if timing_enabled:
+            phase_end = record_cuda_event()
+            timing_events["backward"].append((phase_start, phase_end))
+        phase_start = record_cuda_event() if timing_enabled else None
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if timing_enabled:
+            phase_end = record_cuda_event()
+            timing_events["data"].append((phase_start, phase_end))
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -555,19 +633,35 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:
+        phase_start = record_cuda_event() if timing_enabled else None
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+        if timing_enabled:
+            phase_end = record_cuda_event()
+            timing_events["grad_clip"].append((phase_start, phase_end))
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
         # the found_inf flag (MAX = if any rank found inf, all ranks skip).
         if is_ddp_initialized():
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
+        phase_start = record_cuda_event() if timing_enabled else None
         scaler.step(optimizer)
         scaler.update()
+        if timing_enabled:
+            phase_end = record_cuda_event()
+            timing_events["optimizer"].append((phase_start, phase_end))
     else:
+        phase_start = record_cuda_event() if timing_enabled else None
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+        if timing_enabled:
+            phase_end = record_cuda_event()
+            timing_events["grad_clip"].append((phase_start, phase_end))
+        phase_start = record_cuda_event() if timing_enabled else None
         optimizer.step()
+        if timing_enabled:
+            phase_end = record_cuda_event()
+            timing_events["optimizer"].append((phase_start, phase_end))
     moe_load_imbalance = None
     if args.moe_bias_update_rate > 0 and hasattr(orig_model, "update_moe_expert_bias"):
         moe_load_imbalance = orig_model.update_moe_expert_bias(args.moe_bias_update_rate)
@@ -601,6 +695,35 @@ while True:
     current_memory_gib = get_current_memory() / (1024**3)
     peak_memory_gib = get_max_memory() / (1024**3)
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}% | memory: {current_memory_gib:.2f}/{peak_memory_gib:.2f} GiB | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if timing_enabled:
+        phase_ms = {
+            category: sum(start.elapsed_time(end) for start, end in pairs)
+            for category, pairs in timing_events.items()
+        }
+        accounted_ms = sum(phase_ms.values())
+        other_ms = max(0.0, dt * 1000 - accounted_ms)
+        print0(
+            "timing | "
+            + " | ".join(
+                f"{name}: {milliseconds:.1f}ms ({100 * milliseconds / (dt * 1000):.1f}%)"
+                for name, milliseconds in phase_ms.items()
+            )
+            + f" | other/CPU: {other_ms:.1f}ms ({100 * other_ms / (dt * 1000):.1f}%)"
+        )
+        if component_timer is not None:
+            component_ms = component_timer.elapsed_ms()
+            first_forward_ms = timing_events["forward"][0][0].elapsed_time(
+                timing_events["forward"][0][1]
+            )
+            component_total_ms = sum(component_ms.values())
+            component_ms["other_forward"] = max(0.0, first_forward_ms - component_total_ms)
+            print0(
+                f"timing first microbatch forward ({first_forward_ms:.1f}ms) | "
+                + " | ".join(
+                    f"{name}: {milliseconds:.1f}ms ({100 * milliseconds / first_forward_ms:.1f}%)"
+                    for name, milliseconds in component_ms.items()
+                )
+            )
     if step % 100 == 0:
         lr_log = {f"train/lr_{g['kind']}": g["lr"] for g in optimizer.param_groups}
         log_data = {
