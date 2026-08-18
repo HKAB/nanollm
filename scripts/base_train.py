@@ -96,6 +96,7 @@ parser.add_argument("--warmup-steps", type=int, default=100, help="number of ste
 parser.add_argument("--warmdown-ratio", type=float, default=0.2, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.1, help="final LR as fraction of initial LR")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute activations during backward to save memory (allows larger --device-batch-size)")
+parser.add_argument("--moe-bias-update-rate", type=float, default=1e-3, help="loss-free MoE expert-bias update rate (Ling default: 1e-3; 0 disables)")
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging or unsupported hardware)")
 parser.add_argument("--logit-softcap", type=float, default=0.0, help="tanh softcap applied to logits before cross-entropy loss (0 = disabled, 15-30 typical)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
@@ -558,6 +559,9 @@ while True:
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
         optimizer.step()
+    moe_load_imbalance = None
+    if args.moe_bias_update_rate > 0 and hasattr(orig_model, "update_moe_expert_bias"):
+        moe_load_imbalance = orig_model.update_moe_expert_bias(args.moe_bias_update_rate)
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -605,6 +609,8 @@ while True:
             "system/gpu_memory_peak_gib": peak_memory_gib,
             **lr_log,
         }
+        if moe_load_imbalance is not None:
+            log_data["train/moe_max_relative_load_imbalance"] = moe_load_imbalance
         wandb_run.log(log_data)
 
     # state update

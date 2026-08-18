@@ -9,6 +9,7 @@ PyTorch path is deliberately kept as a correctness and portability fallback.
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
@@ -251,6 +252,12 @@ class MoEGate(nn.Module):
         self.routed_scaling_factor = cfg.routed_scaling_factor
         self.weight = nn.Parameter(torch.empty(cfg.num_experts, cfg.emb_dim))
         self.register_buffer("expert_bias", torch.zeros(cfg.num_experts))
+        # Runtime routing statistics for Ling's auxiliary-loss-free load
+        # balancing. This must not become part of checkpoint compatibility.
+        self.register_buffer(
+            "expert_load", torch.zeros(cfg.num_experts, dtype=torch.float32),
+            persistent=False,
+        )
 
     def forward(self, hidden_states):
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -266,6 +273,16 @@ class MoEGate(nn.Module):
         topk_idx = routing_scores.masked_fill(~expert_mask, -torch.inf).topk(
             self.top_k, dim=-1, sorted=False
         ).indices
+        if self.training:
+            # With gradient checkpointing this is accumulated once in the
+            # forward and once in the recomputation. The common factor cancels
+            # in the relative-load update performed after the optimizer step.
+            with torch.no_grad():
+                self.expert_load.add_(
+                    torch.bincount(
+                        topk_idx.reshape(-1), minlength=self.num_experts
+                    ).to(self.expert_load.dtype)
+                )
         weights = scores.gather(1, topk_idx)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         weights = weights * self.routed_scaling_factor
@@ -585,6 +602,27 @@ class Ling3Model(nn.Module):
     def enable_gradient_checkpointing(self):
         self.use_gradient_checkpointing = True
 
+    @torch.no_grad()
+    def _reset_runtime_buffers(self):
+        # Checkpoint loading constructs the model on meta and then uses
+        # to_empty(), so non-persistent buffers must be populated explicitly.
+        cos, sin = compute_rope_params(
+            self.config.qk_rope_head_dim,
+            self.config.rope_base,
+            self.config.context_length,
+            self.cos.dtype,
+        )
+        self.cos.copy_(cos.to(device=self.cos.device))
+        self.sin.copy_(sin.to(device=self.sin.device))
+        for module in self.modules():
+            if isinstance(module, MoEGate):
+                module.expert_load.zero_()
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        self._reset_runtime_buffers()
+        return result
+
     def get_device(self):
         return self.transformer.wte.weight.device
 
@@ -648,10 +686,24 @@ class Ling3Model(nn.Module):
             dict(kind="adamw", params=nd_params, lr=matrix_lr * scale, betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay),
         ]
         if use_muon:
+            # Ling has thousands of identically-shaped expert matrices. Muon
+            # stacks every parameter in a group, so a single group would add
+            # several GiB of temporary tensors on one GPU. Keep each stack at
+            # most 64M elements (~128 MiB in BF16).
+            max_group_elements = 64 * 1024 * 1024
             for shape in sorted({p.shape for p in matrices}):
-                groups.append(dict(kind="muon", params=[p for p in matrices if p.shape == shape],
-                                   lr=matrix_lr, momentum=0.95, ns_steps=5,
-                                   beta2=0.9, weight_decay=weight_decay))
+                shape_params = [p for p in matrices if p.shape == shape]
+                params_per_group = max(1, max_group_elements // shape.numel())
+                for start in range(0, len(shape_params), params_per_group):
+                    groups.append(dict(
+                        kind="muon",
+                        params=shape_params[start:start + params_per_group],
+                        lr=matrix_lr,
+                        momentum=0.95,
+                        ns_steps=5,
+                        beta2=0.9,
+                        weight_decay=weight_decay,
+                    ))
         else:
             groups.append(dict(kind="adamw", params=matrices, lr=matrix_lr * scale,
                                betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay))
@@ -659,6 +711,34 @@ class Ling3Model(nn.Module):
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
+
+    @torch.no_grad()
+    def update_moe_expert_bias(self, update_rate=1e-3):
+        """Apply Ling's loss-free expert load-balancing update once per step.
+
+        Biased routing scores select experts, while the original sigmoid scores
+        continue to weight their outputs. Underloaded experts receive a positive
+        bias update and overloaded experts a negative one.
+        """
+        gates = [
+            block.mlp.gate for block in self.transformer.h
+            if isinstance(block.mlp, SparseMoE)
+        ]
+        if not gates:
+            return None
+        loads = torch.stack([gate.expert_load for gate in gates])
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loads, op=dist.ReduceOp.SUM)
+        mean_load = loads.mean(dim=-1, keepdim=True)
+        has_load = mean_load.squeeze(-1) > 0
+        updates = update_rate * (mean_load - loads).sign() * has_load[:, None]
+        for gate, update in zip(gates, updates):
+            gate.expert_bias.add_(update)
+            gate.expert_load.zero_()
+        if not has_load.any():
+            return None
+        relative_error = (loads[has_load] - mean_load[has_load]).abs() / mean_load[has_load]
+        return relative_error.max().item()
 
     @torch.no_grad()
     def init_weights(self):
@@ -674,6 +754,7 @@ class Ling3Model(nn.Module):
             if isinstance(module, KimiDeltaAttention):
                 module.A_log.copy_(torch.log(torch.empty_like(module.A_log).uniform_(1, 16)))
                 nn.init.zeros_(module.dt_bias)
+        self._reset_runtime_buffers()
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean",
                 cu_seqlens=None, position_ids=None, logit_positions=None):

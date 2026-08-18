@@ -172,3 +172,19 @@ def test_packed_forward_matches_independent_sequences():
 
     assert torch.allclose(actual[:, :3], expected_first, atol=1e-5, rtol=1e-5)
     assert torch.allclose(actual[:, 3:], expected_second, atol=1e-5, rtol=1e-5)
+
+
+def test_loss_free_moe_bias_update():
+    model = make_model().train()
+    gates = [block.mlp.gate for block in model.transformer.h[1:]]
+    gates[0].expert_load.copy_(torch.tensor([0.0, 1.0, 2.0, 3.0]))
+
+    imbalance = model.update_moe_expert_bias(update_rate=1e-3)
+
+    assert imbalance == pytest.approx(1.0)
+    assert torch.equal(
+        gates[0].expert_bias,
+        torch.tensor([1e-3, 1e-3, -1e-3, -1e-3]),
+    )
+    assert all(torch.count_nonzero(gate.expert_load) == 0 for gate in gates)
+    assert not any(key.endswith("expert_load") for key in model.state_dict())
