@@ -105,6 +105,7 @@ parser.add_argument("--warmup-steps", type=int, default=100, help="number of ste
 parser.add_argument("--warmdown-ratio", type=float, default=0.2, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.1, help="final LR as fraction of initial LR")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute activations during backward to save memory (allows larger --device-batch-size)")
+parser.add_argument("--gradient-checkpointing-interval", type=int, default=1, help="Ling only: checkpoint every Nth MoE block; 1 checkpoints every block (default)")
 parser.add_argument("--moe-bias-update-rate", type=float, default=1e-3, help="loss-free MoE expert-bias update rate (Ling default: 1e-3; 0 disables)")
 parser.add_argument("--moe-backend", type=str, default="auto", choices=["auto", "torch", "transformer_engine"], help="Ling routed-expert backend (auto uses Transformer Engine on CUDA when installed)")
 parser.add_argument("--timing-every", type=int, default=0, help="print lightweight CUDA phase/component timings every N training steps (0 disables)")
@@ -128,6 +129,10 @@ parser.add_argument(
 )
 parser.add_argument("--dataset-root", type=str, required=True, help="root of merged flat shards (output of pretokenize_and_merge.py)")
 args = parser.parse_args()
+if args.gradient_checkpointing_interval < 1:
+    parser.error("--gradient-checkpointing-interval must be at least 1")
+if args.gradient_checkpointing_interval != 1 and not args.gradient_checkpointing:
+    parser.error("--gradient-checkpointing-interval requires --gradient-checkpointing")
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -214,7 +219,22 @@ if resuming:
 # Gradient checkpointing (must be set before torch.compile)
 if args.gradient_checkpointing:
     model.enable_gradient_checkpointing()
-    print0("✓ Gradient checkpointing enabled (activation memory saved, ~33% extra compute)")
+    set_checkpoint_interval = getattr(
+        model, "set_gradient_checkpointing_interval", None
+    )
+    if set_checkpoint_interval is not None:
+        set_checkpoint_interval(args.gradient_checkpointing_interval)
+    elif args.gradient_checkpointing_interval != 1:
+        raise ValueError(
+            f"{type(model).__name__} does not support partial gradient checkpointing"
+        )
+    if args.gradient_checkpointing_interval == 1:
+        print0("✓ Gradient checkpointing enabled for every block")
+    else:
+        print0(
+            "✓ Gradient checkpointing enabled for every "
+            f"{args.gradient_checkpointing_interval}th block"
+        )
 
 # Logit softcap
 if args.logit_softcap > 0:

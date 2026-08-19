@@ -687,6 +687,7 @@ class Ling3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self.use_gradient_checkpointing = False
+        self.gradient_checkpointing_interval = 1
         self.logit_softcap = 0.0
         print0(f"Ling MoE backend: {config.moe_backend}")
         if COMPUTE_DTYPE != torch.float16:
@@ -694,6 +695,23 @@ class Ling3Model(nn.Module):
 
     def enable_gradient_checkpointing(self):
         self.use_gradient_checkpointing = True
+
+    def set_gradient_checkpointing_interval(self, interval):
+        """Checkpoint every Nth MoE block; interval=1 preserves full checkpointing."""
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
+            raise ValueError("gradient checkpointing interval must be a positive integer")
+        self.gradient_checkpointing_interval = interval
+
+    def _should_checkpoint_layer(self, layer_idx):
+        if not self.use_gradient_checkpointing or not self.training:
+            return False
+        if self.gradient_checkpointing_interval == 1:
+            return True
+        first_moe = self.config.first_k_dense_replace
+        return (
+            layer_idx >= first_moe
+            and (layer_idx - first_moe) % self.gradient_checkpointing_interval == 0
+        )
 
     @torch.no_grad()
     def prepare_for_checkpoint_load(self):
@@ -954,8 +972,8 @@ class Ling3Model(nn.Module):
         if cu_seqlens is not None:
             max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
         x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
-        for block in self.transformer.h:
-            if self.use_gradient_checkpointing and self.training:
+        for layer_idx, block in enumerate(self.transformer.h):
+            if self._should_checkpoint_layer(layer_idx):
                 x = gradient_checkpoint(
                     block, x, cos, sin, None, cu_seqlens, max_seqlen,
                     use_reentrant=False,

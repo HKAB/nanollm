@@ -193,6 +193,43 @@ def test_loss_free_moe_bias_update():
     assert not any(key.endswith("expert_load") for key in model.state_dict())
 
 
+def test_gradient_checkpointing_interval_selects_moe_layers(monkeypatch):
+    model = make_model().train()
+    model.enable_gradient_checkpointing()
+    model.set_gradient_checkpointing_interval(2)
+    layer_by_block = {
+        id(block): layer_idx for layer_idx, block in enumerate(model.transformer.h)
+    }
+    checkpointed_layers = []
+
+    def record_checkpoint(block, *args, **kwargs):
+        checkpointed_layers.append(layer_by_block[id(block)])
+        return block(*args)
+
+    monkeypatch.setattr(ling_module, "gradient_checkpoint", record_checkpoint)
+    model(torch.tensor([[1, 2, 3]]))
+
+    # Layer 0 is dense; interval 2 starts from the first MoE layer (layer 1).
+    assert checkpointed_layers == [1, 3]
+
+
+def test_gradient_checkpointing_interval_one_preserves_all_blocks(monkeypatch):
+    model = make_model().train()
+    model.enable_gradient_checkpointing()
+    model.set_gradient_checkpointing_interval(1)
+    checkpoint_count = 0
+
+    def record_checkpoint(block, *args, **kwargs):
+        nonlocal checkpoint_count
+        checkpoint_count += 1
+        return block(*args)
+
+    monkeypatch.setattr(ling_module, "gradient_checkpoint", record_checkpoint)
+    model(torch.tensor([[1, 2, 3]]))
+
+    assert checkpoint_count == model.config.n_layers
+
+
 def test_transformer_engine_moe_adapter_matches_reference(monkeypatch):
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(self, num_groups, in_features, out_features, **kwargs):
