@@ -230,6 +230,83 @@ def test_gradient_checkpointing_interval_one_preserves_all_blocks(monkeypatch):
     assert checkpoint_count == model.config.n_layers
 
 
+def test_liger_linear_cross_entropy_matches_torch(monkeypatch):
+    class FakeLigerLinearCrossEntropy(torch.nn.Module):
+        def __init__(self, ignore_index, reduction, softcap):
+            super().__init__()
+            self.ignore_index = ignore_index
+            self.reduction = reduction
+            self.softcap = softcap
+
+        def forward(self, weight, hidden, targets):
+            logits = torch.nn.functional.linear(hidden, weight)
+            if self.softcap is not None:
+                logits = self.softcap * torch.tanh(logits / self.softcap)
+            return torch.nn.functional.cross_entropy(
+                logits,
+                targets,
+                ignore_index=self.ignore_index,
+                reduction=self.reduction,
+            )
+
+    monkeypatch.setattr(
+        ling_module,
+        "LigerFusedLinearCrossEntropyLoss",
+        FakeLigerLinearCrossEntropy,
+    )
+    monkeypatch.setattr(ling_module, "HAS_LIGER_KERNEL", True)
+    model = make_model()
+    tokens = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    targets = torch.tensor([[2, 3, 4], [5, 6, -1]])
+    model.logit_softcap = 15.0
+
+    with torch.no_grad():
+        expected = model(tokens, targets, loss_reduction="none")
+        model.set_linear_cross_entropy_backend("liger", softcap=15.0)
+        actual = model(tokens, targets, loss_reduction="none")
+
+    assert actual.shape == targets.reshape(-1).shape
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_liger_auto_falls_back_to_torch_on_cpu(monkeypatch):
+    monkeypatch.setattr(ling_module, "HAS_LIGER_KERNEL", True)
+    model = make_model()
+
+    model.set_linear_cross_entropy_backend("auto")
+
+    assert model.linear_cross_entropy_backend == "torch"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not ling_module.HAS_LIGER_KERNEL,
+    reason="requires CUDA and Liger Kernel",
+)
+def test_real_liger_linear_cross_entropy_matches_torch():
+    torch.manual_seed(0)
+    hidden_ref = torch.randn(8, 32, device="cuda", dtype=torch.bfloat16)
+    weight_ref = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+    targets = torch.tensor([1, 2, 3, 4, 5, 6, 7, -1], device="cuda")
+    hidden_ref.requires_grad_()
+    weight_ref.requires_grad_()
+    reference = torch.nn.functional.cross_entropy(
+        torch.nn.functional.linear(hidden_ref, weight_ref),
+        targets,
+        ignore_index=-1,
+    )
+    reference.backward()
+
+    hidden_liger = hidden_ref.detach().clone().requires_grad_()
+    weight_liger = weight_ref.detach().clone().requires_grad_()
+    loss_fn = ling_module.LigerFusedLinearCrossEntropyLoss(ignore_index=-1)
+    actual = loss_fn(weight_liger, hidden_liger, targets)
+    actual.backward()
+
+    assert torch.allclose(actual, reference, atol=2e-3, rtol=2e-3)
+    assert torch.allclose(hidden_liger.grad, hidden_ref.grad, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(weight_liger.grad, weight_ref.grad, atol=2e-2, rtol=2e-2)
+
+
 def test_transformer_engine_moe_adapter_matches_reference(monkeypatch):
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(self, num_groups, in_features, out_features, **kwargs):

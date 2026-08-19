@@ -108,6 +108,7 @@ parser.add_argument("--gradient-checkpointing", action="store_true", help="recom
 parser.add_argument("--gradient-checkpointing-interval", type=int, default=1, help="Ling only: checkpoint every Nth MoE block; 1 checkpoints every block (default)")
 parser.add_argument("--moe-bias-update-rate", type=float, default=1e-3, help="loss-free MoE expert-bias update rate (Ling default: 1e-3; 0 disables)")
 parser.add_argument("--moe-backend", type=str, default="auto", choices=["auto", "torch", "transformer_engine"], help="Ling routed-expert backend (auto uses Transformer Engine on CUDA when installed)")
+parser.add_argument("--linear-cross-entropy-backend", type=str, default="auto", choices=["auto", "torch", "liger"], help="Ling training loss backend (auto uses Liger on CUDA when installed, otherwise PyTorch)")
 parser.add_argument("--timing-every", type=int, default=0, help="print lightweight CUDA phase/component timings every N training steps (0 disables)")
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging or unsupported hardware)")
 parser.add_argument("--logit-softcap", type=float, default=0.0, help="tanh softcap applied to logits before cross-entropy loss (0 = disabled, 15-30 typical)")
@@ -240,6 +241,21 @@ if args.gradient_checkpointing:
 if args.logit_softcap > 0:
     model.logit_softcap = args.logit_softcap
     print0(f"✓ Logit softcap enabled: {args.logit_softcap}")
+
+# Fused linear + cross entropy avoids materializing full training logits. Other
+# models retain their existing PyTorch loss unless Liger is explicitly requested.
+set_linear_cross_entropy_backend = getattr(
+    model, "set_linear_cross_entropy_backend", None
+)
+if set_linear_cross_entropy_backend is not None:
+    set_linear_cross_entropy_backend(
+        args.linear_cross_entropy_backend,
+        softcap=args.logit_softcap,
+    )
+elif args.linear_cross_entropy_backend == "liger":
+    raise ValueError(
+        f"{type(model).__name__} does not support the Liger linear cross entropy backend"
+    )
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
