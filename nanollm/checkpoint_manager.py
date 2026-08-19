@@ -54,7 +54,10 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
-def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+def load_checkpoint(
+    checkpoint_dir, step, device, load_optimizer=False, rank=0,
+    optimizer_device=None,
+):
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     model_data = torch.load(model_path, map_location=device)
@@ -62,7 +65,10 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        optimizer_data = torch.load(optimizer_path, map_location=device)
+        optimizer_data = torch.load(
+            optimizer_path,
+            map_location=device if optimizer_device is None else optimizer_device,
+        )
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:

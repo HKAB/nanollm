@@ -99,6 +99,7 @@ parser.add_argument("--embedding-lr", type=float, default=0.03, help="learning r
 parser.add_argument("--unembedding-lr", type=float, default=0.003, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.10, help="weight decay for matrix params")
 parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "adamw"], help="optimizer for matrix params: muon (default) or adamw (for debugging)")
+parser.add_argument("--optimizer-state-offload", action="store_true", help="store single-GPU optimizer states in pinned CPU memory and stage one group at a time")
 parser.add_argument("--matrix-lr", type=float, default=0.005, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.05, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=100, help="number of steps for LR warmup")
@@ -213,7 +214,14 @@ checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    model_data, optimizer_data, meta_data = load_checkpoint(
+        checkpoint_dir,
+        args.resume_from_step,
+        device,
+        load_optimizer=True,
+        rank=ddp_rank,
+        optimizer_device="cpu" if args.optimizer_state_offload else device,
+    )
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -418,12 +426,24 @@ optimizer = model.setup_optimizer(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
     use_muon=(args.optimizer == "muon"),
+    state_offload=args.optimizer_state_offload,
 )
 print0(f"Optimizer: {args.optimizer} for matrix params")
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+
+if not hasattr(optimizer, "initialize_state"):
+    if args.optimizer_state_offload:
+        raise ValueError("The selected optimizer does not support CPU state offload")
+else:
+    optimizer_state_bytes = optimizer.initialize_state()
+    optimizer_state_device = "pinned CPU" if args.optimizer_state_offload else device
+    print0(
+        "Optimizer state initialized eagerly: "
+        f"{optimizer_state_bytes / 1024**3:.2f} GiB on {optimizer_state_device}"
+    )
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)

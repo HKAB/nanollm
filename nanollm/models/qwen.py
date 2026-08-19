@@ -720,7 +720,7 @@ class Qwen3_5Model(nn.Module):
             'total': sum(p.numel() for p in self.parameters()),
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, use_muon=True):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, use_muon=True, state_offload=False):
         # Based on nanochat optimization setup
         model_dim = self.config.emb_dim
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -757,7 +757,15 @@ class Qwen3_5Model(nn.Module):
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
-        optimizer = Factory(param_groups)
+        if ddp and state_offload:
+            raise ValueError(
+                "CPU optimizer-state offload currently supports single-GPU training only"
+            )
+        optimizer = (
+            Factory(param_groups)
+            if ddp
+            else Factory(param_groups, state_offload=state_offload)
+        )
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer

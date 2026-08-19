@@ -178,8 +178,10 @@ class MuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
-    def __init__(self, param_groups: list[dict]):
+    def __init__(self, param_groups: list[dict], state_offload: bool = False):
         super().__init__(param_groups, defaults={})
+        self.state_offload = state_offload
+        self._pin_offloaded_state = state_offload and torch.cuda.is_available()
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         # AdamW tensors
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -193,6 +195,89 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+
+    def _new_state_tensor(self, shape, *, dtype, device):
+        if self.state_offload:
+            return torch.zeros(
+                shape,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=self._pin_offloaded_state,
+            )
+        return torch.zeros(shape, dtype=dtype, device=device)
+
+    def _move_state_to_storage(self, tensor):
+        if not self.state_offload:
+            return tensor
+        if tensor.device.type == "cpu" and (
+            not self._pin_offloaded_state or tensor.is_pinned()
+        ):
+            return tensor
+        stored = torch.empty(
+            tensor.shape,
+            dtype=tensor.dtype,
+            device="cpu",
+            pin_memory=self._pin_offloaded_state,
+        )
+        stored.copy_(tensor)
+        return stored
+
+    def initialize_state(self):
+        """Eagerly materialize steady-state optimizer memory before training."""
+        for group in self.param_groups:
+            params = group["params"]
+            if group["kind"] == "adamw":
+                for p in params:
+                    state = self.state[p]
+                    state.setdefault("step", 0)
+                    for name in ("exp_avg", "exp_avg_sq"):
+                        if name not in state:
+                            state[name] = self._new_state_tensor(
+                                p.shape, dtype=p.dtype, device=p.device
+                            )
+                        else:
+                            state[name] = self._move_state_to_storage(state[name])
+            elif group["kind"] == "muon" and params:
+                p = params[0]
+                state = self.state[p]
+                shape = p.shape
+                num_params = len(params)
+                second_shape = (
+                    (num_params, shape[-2], 1)
+                    if shape[-2] >= shape[-1]
+                    else (num_params, 1, shape[-1])
+                )
+                expected = {
+                    "momentum_buffer": (num_params, *shape),
+                    "second_momentum_buffer": second_shape,
+                }
+                for name, state_shape in expected.items():
+                    if name not in state:
+                        state[name] = self._new_state_tensor(
+                            state_shape, dtype=p.dtype, device=p.device
+                        )
+                    else:
+                        state[name] = self._move_state_to_storage(state[name])
+            elif group["kind"] not in {"adamw", "muon"}:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+
+        return sum(
+            value.numel() * value.element_size()
+            for state in self.state.values()
+            for value in state.values()
+            if isinstance(value, Tensor)
+        )
+
+    @staticmethod
+    def _stage_state(tensor, device):
+        if tensor.device == device:
+            return tensor
+        return tensor.to(device=device, non_blocking=False)
+
+    @staticmethod
+    def _store_state(stored, staged):
+        if stored is not staged:
+            stored.copy_(staged, non_blocking=False)
 
     def _step_adamw(self, group: dict) -> None:
         """
@@ -208,10 +293,16 @@ class MuonAdamW(torch.optim.Optimizer):
             # State init
             if not state:
                 state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
-            exp_avg = state['exp_avg']
-            exp_avg_sq = state['exp_avg_sq']
+                state['exp_avg'] = self._new_state_tensor(
+                    p.shape, dtype=p.dtype, device=p.device
+                )
+                state['exp_avg_sq'] = self._new_state_tensor(
+                    p.shape, dtype=p.dtype, device=p.device
+                )
+            stored_exp_avg = state['exp_avg']
+            stored_exp_avg_sq = state['exp_avg_sq']
+            exp_avg = self._stage_state(stored_exp_avg, p.device)
+            exp_avg_sq = self._stage_state(stored_exp_avg_sq, p.device)
             state['step'] += 1
 
             # Fill 0-D tensors with current values
@@ -228,6 +319,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
                 self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
             )
+            self._store_state(stored_exp_avg, exp_avg)
+            self._store_state(stored_exp_avg_sq, exp_avg_sq)
 
     def _step_muon(self, group: dict) -> None:
         """
@@ -238,24 +331,7 @@ class MuonAdamW(torch.optim.Optimizer):
         if not params:
             return
 
-        # Get or create group-level buffers (stored in first param's state for convenience)
-        p = params[0]
-        state = self.state[p]
         num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
-
-        # Momentum for every individual parameter
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        momentum_buffer = state["momentum_buffer"]
-
-        # Second momentum buffer is factored, either per-row or per-column
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        second_momentum_buffer = state["second_momentum_buffer"]
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-
         # Sparse MoE experts may receive no tokens, in which case autograd
         # leaves their gradients as None. Keep a fixed stack shape (important
         # for the compiled fused kernel), but remember those slots so both the
@@ -264,6 +340,30 @@ class MuonAdamW(torch.optim.Optimizer):
         active_indices = [i for i, param in enumerate(params) if param.grad is not None]
         if not active_indices:
             return
+
+        # Stage one bounded optimizer group at a time when state is CPU-offloaded.
+        p = params[0]
+        state = self.state[p]
+        shape, device, dtype = p.shape, p.device, p.dtype
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = self._new_state_tensor(
+                (num_params, *shape), dtype=dtype, device=device
+            )
+        if "second_momentum_buffer" not in state:
+            state_shape = (
+                (num_params, shape[-2], 1)
+                if shape[-2] >= shape[-1]
+                else (num_params, 1, shape[-1])
+            )
+            state["second_momentum_buffer"] = self._new_state_tensor(
+                state_shape, dtype=dtype, device=device
+            )
+        stored_momentum = state["momentum_buffer"]
+        stored_second_momentum = state["second_momentum_buffer"]
+        momentum_buffer = self._stage_state(stored_momentum, device)
+        second_momentum_buffer = self._stage_state(stored_second_momentum, device)
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+
         inactive_indices = [i for i, param in enumerate(params) if param.grad is None]
         stacked_grads = torch.zeros(
             num_params, *shape, dtype=dtype, device=device
@@ -312,6 +412,8 @@ class MuonAdamW(torch.optim.Optimizer):
             [params[i] for i in active_indices],
             [stacked_params[i] for i in active_indices],
         )
+        self._store_state(stored_momentum, momentum_buffer)
+        self._store_state(stored_second_momentum, second_momentum_buffer)
 
     @torch.no_grad()
     def step(self):

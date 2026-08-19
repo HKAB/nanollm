@@ -905,7 +905,7 @@ class Ling3Model(nn.Module):
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2,
                         matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5,
-                        use_muon=True):
+                        use_muon=True, state_offload=False):
         model_dim = self.config.emb_dim
         ddp, *_ = get_dist_info()
         embeddings = list(self.transformer.wte.parameters())
@@ -943,7 +943,15 @@ class Ling3Model(nn.Module):
         else:
             groups.append(dict(kind="adamw", params=matrices, lr=matrix_lr * scale,
                                betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay))
-        optimizer = (DistMuonAdamW if ddp else MuonAdamW)(groups)
+        if ddp and state_offload:
+            raise ValueError(
+                "CPU optimizer-state offload currently supports single-GPU training only"
+            )
+        optimizer = (
+            DistMuonAdamW(groups)
+            if ddp
+            else MuonAdamW(groups, state_offload=state_offload)
+        )
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
