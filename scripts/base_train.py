@@ -66,6 +66,7 @@ from nanollm.report import get_report
 from nanollm.flash_attention import HAS_FA3
 from nanollm.loss_eval import evaluate_loss
 from nanollm.models.qwen import Linear
+from nanollm.profiler import CudaModuleProfiler
 from nanollm.tokenizer import get_tokenizer
 from scripts.base_eval import evaluate_core
 
@@ -111,6 +112,7 @@ parser.add_argument("--moe-bias-update-rate", type=float, default=1e-3, help="lo
 parser.add_argument("--moe-backend", type=str, default="auto", choices=["auto", "torch", "transformer_engine"], help="Ling routed-expert backend (auto uses Transformer Engine on CUDA when installed)")
 parser.add_argument("--linear-cross-entropy-backend", type=str, default="auto", choices=["auto", "torch", "liger"], help="Ling training loss backend (auto uses Liger on CUDA when installed, otherwise PyTorch)")
 parser.add_argument("--timing-every", type=int, default=0, help="print lightweight CUDA phase/component timings every N training steps (0 disables)")
+parser.add_argument("--profile-module", action="append", default=[], metavar="LABEL=GLOB", help="aggregate first-microbatch CUDA forward time by module name glob or type:ClassGlob; repeatable")
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging or unsupported hardware)")
 parser.add_argument("--logit-softcap", type=float, default=0.0, help="tanh softcap applied to logits before cross-entropy loss (0 = disabled, 15-30 typical)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
@@ -470,52 +472,6 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # -----------------------------------------------------------------------------
 # Training loop
 
-class CudaComponentTimer:
-    """Time selected Ling modules for one forward without synchronizing."""
-
-    def __init__(self, model):
-        self.events = {}
-        self.handles = []
-        self.pending = {}
-        for name, module in model.named_modules():
-            type_name = type(module).__name__
-            if type_name == "KimiDeltaAttention":
-                category = "kda"
-            elif type_name == "MultiLatentAttention":
-                category = "mla"
-            elif type_name == "SparseMoE":
-                category = "moe"
-            elif type_name == "FeedForward" and name == "transformer.h.0.mlp":
-                category = "dense_mlp"
-            else:
-                continue
-
-            def pre_hook(mod, inputs, category=category):
-                start = torch.cuda.Event(enable_timing=True)
-                start.record()
-                self.pending[id(mod)] = (category, start)
-
-            def post_hook(mod, inputs, output):
-                category, start = self.pending.pop(id(mod))
-                end = torch.cuda.Event(enable_timing=True)
-                end.record()
-                self.events.setdefault(category, []).append((start, end))
-
-            self.handles.append(module.register_forward_pre_hook(pre_hook))
-            self.handles.append(module.register_forward_hook(post_hook))
-
-    def close(self):
-        for handle in self.handles:
-            handle.remove()
-        self.handles.clear()
-
-    def elapsed_ms(self):
-        return {
-            category: sum(start.elapsed_time(end) for start, end in pairs)
-            for category, pairs in self.events.items()
-        }
-
-
 def record_cuda_event():
     event = torch.cuda.Event(enable_timing=True)
     event.record()
@@ -661,8 +617,8 @@ while True:
     }
     component_timer = None
     for micro_step in range(grad_accum_steps):
-        if timing_enabled and micro_step == 0:
-            component_timer = CudaComponentTimer(orig_model)
+        if timing_enabled and micro_step == 0 and args.profile_module:
+            component_timer = CudaModuleProfiler(orig_model, args.profile_module)
         phase_start = record_cuda_event() if timing_enabled else None
         loss = model(x, y)
         if timing_enabled:
