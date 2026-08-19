@@ -3,6 +3,7 @@
 
 export WANDB_MODE=offline
 export NANOLLM_CACHE_DIR=/mnt/data/users/truongnp5/uv_env/nanoqwen35/.cache/nanollm
+export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cudnn/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python -m scripts.base_train \
@@ -17,7 +18,7 @@ python -m scripts.base_train \
     --dataset-root /mnt/data/users/truongnp5/final_clean_data/vi_en_parquet_v1_pretokenized_ling \
     --max-seq-len 8192 \
     --num-iterations 57220 \
-    --device-batch-size 1 \
+    --device-batch-size 2 \
     --total-batch-size 1048576 \
     --embedding-lr 5e-5 \
     --unembedding-lr 5e-5 \
@@ -33,4 +34,5 @@ python -m scripts.base_train \
     --core-metric-every 1000 \
     --core-metric-max-per-task 1000 \
     --sample-every 1000 \
-    --save-every 5000
+    --save-every 5000 \
+    --timing-every 1
