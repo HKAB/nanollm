@@ -52,22 +52,7 @@ from nanollm.engine import Engine
 from nanollm.flash_attention import HAS_FA3
 from nanollm.loss_eval import evaluate_loss
 from scripts.chat_eval import run_chat_eval
-
-
-# Bounded periodic evaluation: categorical tasks can afford larger subsets;
-# long-form generation gets smaller but still representative samples.
-CHATCORE_TASK_CONFIG = {
-    "GlobalMMLU": {"limit": 500, "baseline": 0.25},
-    "NLR-Causal-Reasoning-vi": {"limit": 500, "baseline": 0.5},
-    "ViANLI": {"limit": 300, "baseline": 1 / 3},
-    "UIT-VSMEC": {"limit": 350, "baseline": 1 / 7},
-    "UIT-VSFC-Sentiment": {"limit": 300, "baseline": 1 / 3},
-    "UIT-ViQuAD-QA": {"limit": 250, "baseline": 0.0},
-    "UIT-ViQuAD-Hallucination": {"limit": 250, "baseline": 0.0},
-    "V-IFEval": {"limit": 500, "baseline": 0.0},
-    # Validation has only 100 labeled clusters; the 300-example test is unlabeled.
-    "AbMusu": {"limit": 100, "baseline": 0.0},
-}
+from tasks.sft.registry import CHAT_TASKS, CHAT_TASKS_BY_NAME
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -336,8 +321,9 @@ while True:
         task_results = {}
         task_metrics = {}
         task_timings = {}
-        for task_name, task_config in CHATCORE_TASK_CONFIG.items():
-            limit = task_config["limit"]
+        for task in CHAT_TASKS:
+            task_name = task.name
+            limit = task.periodic_limit
             acc = run_chat_eval(
                 task_name,
                 model,
@@ -361,7 +347,7 @@ while True:
 
         centered_scores = []
         for task_name, score in task_results.items():
-            baseline = CHATCORE_TASK_CONFIG[task_name]["baseline"]
+            baseline = CHAT_TASKS_BY_NAME[task_name].random_baseline
             centered_scores.append((score - baseline) / (1.0 - baseline))
         chatcore = sum(centered_scores) / len(centered_scores)
         last_chatcore = chatcore

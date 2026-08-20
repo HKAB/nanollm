@@ -3,6 +3,7 @@
 
 export WANDB_MODE=offline
 export NANOLLM_CACHE_DIR=/mnt/data/users/truongnp5/uv_env/nanoqwen35/.cache/nanollm
+export NANOLLM_CORE_DATASET_REVISION=HKAB/nanollm-core
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --nproc_per_node=8 --rdzv-conf "timeout=7200" -m scripts.base_train -- \

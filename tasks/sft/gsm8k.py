@@ -4,7 +4,7 @@ GSM8K generative math task.
 Backed by Hugging Face dataset `openai/gsm8k`.
 
 Each example is exposed as a conversation in the same shape as
-`tasks/global_mmlu.py`:
+`tasks/sft/global_mmlu.py`:
 
 {
   "messages": [

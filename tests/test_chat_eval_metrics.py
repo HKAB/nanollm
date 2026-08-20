@@ -154,7 +154,11 @@ def test_run_chat_eval_dispatches_categorical_with_engine_model(monkeypatch):
     class Engine:
         model = inference_model
 
-    monkeypatch.setattr(chat_eval, "GlobalMMLU", lambda *args, **kwargs: FakeCategoricalTask())
+    monkeypatch.setattr(
+        chat_eval,
+        "create_chat_task",
+        lambda *args, **kwargs: FakeCategoricalTask(),
+    )
     monkeypatch.setattr(chat_eval, "get_dist_info", lambda: (False, 0, 0, 1))
     monkeypatch.setattr(chat_eval, "print0", lambda *args, **kwargs: None)
 

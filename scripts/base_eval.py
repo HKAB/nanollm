@@ -17,16 +17,9 @@ Examples:
     python -m scripts.base_eval --model-tag d24 --device-batch-size=16 --max-per-task=100 --split-tokens=524288
 """
 import argparse
-import csv
-import json
 import os
 import random
-import shutil
-import tempfile
 import time
-import zipfile
-
-import yaml
 
 from nanollm.checkpoint_manager import load_pretrained_hf
 from nanollm.common import (
@@ -41,72 +34,32 @@ from nanollm.dataloader import pretrain_loader
 from nanollm.engine import Engine
 from nanollm.loss_eval import evaluate_loss
 from nanollm.report import get_report       
+from tasks.pretrain.core import CORE_TASKS, load_core_data
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
-
-def place_eval_bundle(file_path):
-    """Unzip eval_bundle.zip and place it in the base directory."""
-    base_dir = get_base_dir()
-    eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with zipfile.ZipFile(file_path, 'r') as zip_ref:
-            zip_ref.extractall(tmpdir)
-        extracted_bundle_dir = os.path.join(tmpdir, "eval_bundle")
-        shutil.move(extracted_bundle_dir, eval_bundle_dir)
-    print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
-
 
 def evaluate_core(model, tokenizer, device, max_per_task=-1):
     """
     Evaluate a base model on the CORE benchmark.
     Returns dict with results, centered_results, and core_metric.
     """
-    base_dir = get_base_dir()
-    eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
-    # Download the eval bundle if needed
-    if not os.path.exists(eval_bundle_dir):
-        print0(f"Eval bundle not found at {eval_bundle_dir}")
-        return {
-            "results": {},
-            "centered_results": {},
-            "core_metric": 0.0
-        }
-
-    config_path = os.path.join(eval_bundle_dir, "core.yaml")
-    data_base_path = os.path.join(eval_bundle_dir, "eval_data")
-    eval_meta_data = os.path.join(eval_bundle_dir, "eval_meta_data.csv")
-
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    tasks = config['icl_tasks']
-
-    # Load random baseline values
-    random_baselines = {}
-    with open(eval_meta_data, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            task_name = row['Eval Task']
-            random_baseline = row['Random baseline']
-            random_baselines[task_name] = float(random_baseline)
+    data_by_task = load_core_data()
 
     # Evaluate each task
     results = {}
     centered_results = {}
-    for task in tasks:
+    for task in CORE_TASKS:
         start_time = time.time()
-        label = task['label']
+        label = task.label
         task_meta = {
-            'task_type': task['icl_task_type'],
-            'dataset_uri': task['dataset_uri'],
-            'num_fewshot': task['num_fewshot'][0],
-            'continuation_delimiter': task.get('continuation_delimiter', ' ')
+            'task_type': task.task_type,
+            'num_fewshot': task.num_fewshot,
+            'continuation_delimiter': task.continuation_delimiter,
         }
         print0(f"Evaluating: {label} ({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})... ", end='')
 
-        data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
-        with open(data_path, 'r', encoding='utf-8') as f:
-            data = [json.loads(line.strip()) for line in f]
+        data = list(data_by_task[label])
 
         # Shuffle for consistent subsampling when using max_per_task
         shuffle_rng = random.Random(1337)
@@ -116,8 +69,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 
         accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
         results[label] = accuracy
-        random_baseline = random_baselines[label]
-        centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
+        centered_result = (accuracy - task.random_baseline) / (1.0 - task.random_baseline)
         centered_results[label] = centered_result
         elapsed = time.time() - start_time
         print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")

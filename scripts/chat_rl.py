@@ -43,7 +43,7 @@ from nanollm.common import (
     print0,
 )
 from nanollm.engine import Engine
-from tasks.gsm8k import GSM8K
+from tasks.sft.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
 # CLI arguments

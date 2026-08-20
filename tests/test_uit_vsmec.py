@@ -1,4 +1,4 @@
-from tasks import uit_vsmec
+from tasks.sft import uit_vsmec
 
 
 class FakeDataset(list):

@@ -1,6 +1,6 @@
 import pytest
 
-from tasks import abmusu
+from tasks.sft import abmusu
 from nanollm.tokenizers.qwen_tokenizer import QwenTokenizer
 
 

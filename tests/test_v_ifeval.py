@@ -1,4 +1,4 @@
-from tasks.v_ifeval import DATASET_NAME, VIFEval, aggregate_results, evaluate_response
+from tasks.sft.v_ifeval import DATASET_NAME, VIFEval, aggregate_results, evaluate_response
 
 
 class ContainsChecker:

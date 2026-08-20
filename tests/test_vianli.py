@@ -1,4 +1,4 @@
-from tasks import vianli
+from tasks.sft import vianli
 
 
 class FakeDataset(list):

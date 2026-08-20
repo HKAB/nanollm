@@ -757,15 +757,7 @@ class Qwen3_5Model(nn.Module):
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
-        if ddp and state_offload:
-            raise ValueError(
-                "CPU optimizer-state offload currently supports single-GPU training only"
-            )
-        optimizer = (
-            Factory(param_groups)
-            if ddp
-            else Factory(param_groups, state_offload=state_offload)
-        )
+        optimizer = Factory(param_groups, state_offload=state_offload)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer

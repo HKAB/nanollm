@@ -429,7 +429,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Distributed version of the MuonAdamW optimizer.
 # Used for training on multiple GPUs.
 
-class DistMuonAdamW(torch.optim.Optimizer):
+class DistMuonAdamW(MuonAdamW):
     """
     Combined distributed optimizer: Muon for 2D matrix params, AdamW for others.
 
@@ -487,19 +487,76 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
-    def __init__(self, param_groups: list[dict]):
-        super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+    def __init__(self, param_groups: list[dict], state_offload: bool = False):
+        super().__init__(param_groups, state_offload=state_offload)
+
+    def initialize_state(self):
+        """Eagerly initialize only the optimizer-state shard owned by this rank."""
+        world_size = dist.get_world_size()
+        for group in self.param_groups:
+            params = group["params"]
+            if group["kind"] == "adamw":
+                for p in params:
+                    state = self.state[p]
+                    state.setdefault("step", 0)
+                    if p.numel() < 1024:
+                        state_shape = p.shape
+                    else:
+                        if p.shape[0] % world_size != 0:
+                            raise ValueError(
+                                "Distributed AdamW requires parameter dimension 0 "
+                                f"({p.shape[0]}) to be divisible by world size ({world_size})"
+                            )
+                        state_shape = (p.shape[0] // world_size, *p.shape[1:])
+                    for name in ("exp_avg", "exp_avg_sq"):
+                        if name not in state:
+                            state[name] = self._new_state_tensor(
+                                state_shape, dtype=p.dtype, device=p.device
+                            )
+                        else:
+                            if tuple(state[name].shape) != tuple(state_shape):
+                                raise ValueError(
+                                    f"Loaded distributed optimizer state {name!r} has "
+                                    f"shape {tuple(state[name].shape)}, expected "
+                                    f"{tuple(state_shape)}; resume with the same world size"
+                                )
+                            state[name] = self._move_state_to_storage(state[name])
+            elif group["kind"] == "muon" and params:
+                p = params[0]
+                state = self.state[p]
+                shape = p.shape
+                chunk_size = (len(params) + world_size - 1) // world_size
+                second_shape = (
+                    (chunk_size, shape[-2], 1)
+                    if shape[-2] >= shape[-1]
+                    else (chunk_size, 1, shape[-1])
+                )
+                expected = {
+                    "momentum_buffer": (chunk_size, *shape),
+                    "second_momentum_buffer": second_shape,
+                }
+                for name, state_shape in expected.items():
+                    if name not in state:
+                        state[name] = self._new_state_tensor(
+                            state_shape, dtype=p.dtype, device=p.device
+                        )
+                    else:
+                        if tuple(state[name].shape) != tuple(state_shape):
+                            raise ValueError(
+                                f"Loaded distributed optimizer state {name!r} has "
+                                f"shape {tuple(state[name].shape)}, expected "
+                                f"{tuple(state_shape)}; resume with the same world size"
+                            )
+                        state[name] = self._move_state_to_storage(state[name])
+            elif group["kind"] not in {"adamw", "muon"}:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+
+        return sum(
+            value.numel() * value.element_size()
+            for state in self.state.values()
+            for value in state.values()
+            if isinstance(value, Tensor)
+        )
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -559,8 +616,16 @@ class DistMuonAdamW(torch.optim.Optimizer):
             # State init
             if not state:
                 state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p_slice)
-                state['exp_avg_sq'] = torch.zeros_like(p_slice)
+                state['exp_avg'] = self._new_state_tensor(
+                    p_slice.shape, dtype=p.dtype, device=p.device
+                )
+                state['exp_avg_sq'] = self._new_state_tensor(
+                    p_slice.shape, dtype=p.dtype, device=p.device
+                )
+            stored_exp_avg = state['exp_avg']
+            stored_exp_avg_sq = state['exp_avg_sq']
+            exp_avg = self._stage_state(stored_exp_avg, p.device)
+            exp_avg_sq = self._stage_state(stored_exp_avg_sq, p.device)
             state['step'] += 1
 
             # Fill 0-D tensors and run fused kernel
@@ -571,10 +636,12 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._adamw_eps_t.fill_(group['eps'])
             self._adamw_wd_t.fill_(group['weight_decay'])
             adamw_step_fused(
-                p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
+                p_slice, grad_slice, exp_avg, exp_avg_sq,
                 self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
                 self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
             )
+            self._store_state(stored_exp_avg, exp_avg)
+            self._store_state(stored_exp_avg_sq, exp_avg_sq)
 
             # Large params need all_gather
             if not pinfo['is_small']:
@@ -597,10 +664,18 @@ class DistMuonAdamW(torch.optim.Optimizer):
         # Get or create group-level state
         state = self.state[p]
         if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+            state["momentum_buffer"] = self._new_state_tensor(
+                (chunk_size, *shape), dtype=dtype, device=device
+            )
         if "second_momentum_buffer" not in state:
             state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+            state["second_momentum_buffer"] = self._new_state_tensor(
+                state_shape, dtype=dtype, device=device
+            )
+        stored_momentum = state["momentum_buffer"]
+        stored_second_momentum = state["second_momentum_buffer"]
+        momentum_buffer = self._stage_state(stored_momentum, device)
+        second_momentum_buffer = self._stage_state(stored_second_momentum, device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Build output buffer for all_gather
@@ -617,11 +692,14 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                momentum_buffer[:num_owned], second_momentum_buffer[:num_owned],
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
                 group["ns_steps"], red_dim,
             )
             updated_params[:num_owned].copy_(stacked_owned)
+
+        self._store_state(stored_momentum, momentum_buffer)
+        self._store_state(stored_second_momentum, second_momentum_buffer)
 
         if num_owned < chunk_size:
             updated_params[num_owned:].zero_()

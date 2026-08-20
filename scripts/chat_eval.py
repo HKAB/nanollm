@@ -24,14 +24,7 @@ from nanollm.common import (
     print0,
 )
 from nanollm.engine import Engine
-from tasks.abmusu import AbMusu
-from tasks.global_mmlu import GlobalMMLU
-from tasks.nlr_causal_reasoning import NLRCausalReasoningVI
-from tasks.uit_viquad import UITViQuADHallucination, UITViQuADQA
-from tasks.uit_vsfc import UITVSFCSentiment
-from tasks.uit_vsmec import UITVSMEC
-from tasks.vianli import ViANLI
-from tasks.v_ifeval import VIFEval
+from tasks.sft.registry import CHAT_TASKS, create_chat_task
 
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
@@ -635,23 +628,10 @@ def run_chat_eval(task_name, model, tokenizer, engine,
                    shuffle=False, seed=42):
     device = model.get_device()
     engine.last_generation_stats = None
-    task_factories = {
-        'GlobalMMLU': lambda: GlobalMMLU('./.cache/nanollm/eval_bundle/eval_data/global_mmlu.jsonl', shuffle=shuffle, seed=seed),
-        'NLR-Causal-Reasoning-vi': lambda: NLRCausalReasoningVI(shuffle=shuffle, seed=seed),
-        'UIT-ViQuAD-Hallucination': lambda: UITViQuADHallucination(split='validation', shuffle=shuffle, seed=seed),
-        'UIT-ViQuAD-QA': lambda: UITViQuADQA(split='validation', shuffle=shuffle, seed=seed),
-        'UIT-VSFC-Sentiment': lambda: UITVSFCSentiment(shuffle=shuffle, seed=seed),
-        'UIT-VSMEC': lambda: UITVSMEC(shuffle=shuffle, seed=seed),
-        'ViANLI': lambda: ViANLI(shuffle=shuffle, seed=seed),
-        'V-IFEval': lambda: VIFEval(shuffle=shuffle, seed=seed),
-        'AbMusu': lambda: AbMusu(shuffle=shuffle, seed=seed),
-    }
-    if task_name not in task_factories:
-        raise ValueError(f"Unknown task: {task_name!r}. Available: {list(task_factories)}")
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     started_at = time.perf_counter()
-    task_object = task_factories[task_name]()
+    task_object = create_chat_task(task_name, shuffle=shuffle, seed=seed)
     max_new_tokens = task_object.max_new_tokens
     if task_object.eval_type == 'generative':
         acc = run_generative_eval(
@@ -768,27 +748,9 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
-    all_tasks = [
-        'GlobalMMLU',
-        'NLR-Causal-Reasoning-vi',
-        'UIT-ViQuAD-Hallucination',
-        'UIT-ViQuAD-QA',
-        'UIT-VSMEC',
-        'UIT-VSFC-Sentiment',
-        'ViANLI',
-        'V-IFEval',
-        'AbMusu',
-    ]
+    all_tasks = [task.name for task in CHAT_TASKS]
     baseline_accuracies = {
-        'GlobalMMLU': 0.25, # multiple choice 1 of 4 => 25%
-        'NLR-Causal-Reasoning-vi': 0.5, # random choice between A and B
-        'UIT-ViQuAD-Hallucination': 0.0,
-        'UIT-ViQuAD-QA': 0.0,
-        'UIT-VSMEC': 1 / 7, # random choice among seven emotion labels
-        'UIT-VSFC-Sentiment': 1 / 3, # random choice among three sentiments
-        'ViANLI': 1 / 3, # random choice among three NLI relations
-        'V-IFEval': 0.0, # no meaningful random instruction-following baseline
-        'AbMusu': 0.0, # no meaningful random summarization baseline
+        task.name: task.random_baseline for task in CHAT_TASKS
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 

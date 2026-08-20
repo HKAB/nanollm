@@ -1,4 +1,4 @@
-from tasks import uit_viquad
+from tasks.sft import uit_viquad
 
 
 class FakeDataset(list):

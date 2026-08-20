@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import nanollm.optim as optim_module
-from nanollm.optim import MuonAdamW
+from nanollm.optim import DistMuonAdamW, MuonAdamW
 
 
 def test_muon_skips_parameters_with_none_grad(monkeypatch):
@@ -144,3 +144,38 @@ def test_cuda_optimizer_state_offload_matches_resident(monkeypatch):
         if isinstance(value, torch.Tensor)
     ]
     assert all(tensor.device.type == "cpu" and tensor.is_pinned() for tensor in state_tensors)
+
+
+def test_distributed_eager_offload_initializes_rank_local_shards(monkeypatch):
+    monkeypatch.setattr(optim_module.dist, "get_world_size", lambda: 2)
+    adam_param = torch.nn.Parameter(torch.zeros(1024, 2))
+    muon_params = [
+        torch.nn.Parameter(torch.zeros(2, 2)) for _ in range(3)
+    ]
+    optimizer = DistMuonAdamW([
+        {
+            "kind": "adamw", "params": [adam_param], "lr": 1e-3,
+            "betas": (0.9, 0.95), "eps": 1e-8, "weight_decay": 0.0,
+        },
+        {
+            "kind": "muon", "params": muon_params, "lr": 1e-3,
+            "momentum": 0.9, "ns_steps": 1, "beta2": 0.9,
+            "weight_decay": 0.0,
+        },
+    ], state_offload=True)
+
+    state_bytes = optimizer.initialize_state()
+
+    adam_state = optimizer.state[adam_param]
+    muon_state = optimizer.state[muon_params[0]]
+    assert adam_state["exp_avg"].shape == (512, 2)
+    assert adam_state["exp_avg_sq"].shape == (512, 2)
+    assert muon_state["momentum_buffer"].shape == (2, 2, 2)
+    assert muon_state["second_momentum_buffer"].shape == (2, 2, 1)
+    assert state_bytes == 8240
+    assert all(
+        value.device.type == "cpu"
+        for state in optimizer.state.values()
+        for value in state.values()
+        if isinstance(value, torch.Tensor)
+    )

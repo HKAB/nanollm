@@ -3,6 +3,7 @@
 
 export WANDB_MODE=offline
 export NANOLLM_CACHE_DIR=/mnt/data/users/truongnp5/uv_env/nanoqwen35/.cache/nanollm
+export NANOLLM_CORE_DATASET_REVISION=HKAB/nanollm-core
 export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cudnn/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \

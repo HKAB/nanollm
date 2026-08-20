@@ -1,4 +1,4 @@
-from tasks import nlr_causal_reasoning
+from tasks.sft import nlr_causal_reasoning
 
 
 class FakeDataset(list):

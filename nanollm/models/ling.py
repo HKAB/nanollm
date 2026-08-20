@@ -943,12 +943,8 @@ class Ling3Model(nn.Module):
         else:
             groups.append(dict(kind="adamw", params=matrices, lr=matrix_lr * scale,
                                betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay))
-        if ddp and state_offload:
-            raise ValueError(
-                "CPU optimizer-state offload currently supports single-GPU training only"
-            )
         optimizer = (
-            DistMuonAdamW(groups)
+            DistMuonAdamW(groups, state_offload=state_offload)
             if ddp
             else MuonAdamW(groups, state_offload=state_offload)
         )
