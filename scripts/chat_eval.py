@@ -27,43 +27,12 @@ from nanovllm import EngineConfig, LLMEngine, SamplingParams
 from tasks.sft.registry import CHAT_TASKS, create_chat_task
 
 # -----------------------------------------------------------------------------
-# Generative evaluation loop (we go one problem at a time, sample, evaluate)
-
-
-def _generate_prompt_samples(
-    engine,
-    prompts,
-    *,
-    num_samples,
-    batch_size,
-    max_new_tokens,
-    temperature,
-    top_k,
-):
-    """Generate N samples per prompt through the shared runtime."""
-    generated = engine.generate(
-        prompts,
-        sampling=SamplingParams(
-            num_samples=num_samples,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        ),
-    )
-    generated = [
-        result.prompt_token_ids + result.output_token_ids
-        for result in generated
-    ]
-    return [
-        generated[i:i + num_samples]
-        for i in range(0, len(generated), num_samples)
-    ]
+# Generative evaluation loop
 
 
 def run_generative_eval(
     task_object, tokenizer, model, engine, num_samples, max_new_tokens,
-    temperature, top_k, batch_size=32,
-    max_problems=None,
+    temperature, top_k, max_problems=None,
 ):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
@@ -78,15 +47,23 @@ def run_generative_eval(
         tokenizer.render_for_completion(conversation)
         for conversation in local_conversations
     ]
-    generated_groups = _generate_prompt_samples(
-        engine,
+    generated = engine.generate(
         encoded_prompts,
-        num_samples=num_samples,
-        batch_size=batch_size,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
+        sampling=SamplingParams(
+            num_samples=num_samples,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        ),
     )
+    generated = [
+        result.prompt_token_ids + result.output_token_ids
+        for result in generated
+    ]
+    generated_groups = [
+        generated[i:i + num_samples]
+        for i in range(0, len(generated), num_samples)
+    ]
 
     num_passed, total = 0, 0
     for conversation, encoded_prompt, results in zip(
@@ -639,8 +616,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     if task_object.eval_type == 'generative':
         acc = run_generative_eval(
             task_object, tokenizer, model, engine, num_samples, max_new_tokens,
-            temperature, top_k, batch_size=batch_size,
-            max_problems=max_problems,
+            temperature, top_k, max_problems=max_problems,
         )
     elif task_object.eval_type == 'categorical':
         # The engine owns the eager inference model. During chat_sft, ``model``
