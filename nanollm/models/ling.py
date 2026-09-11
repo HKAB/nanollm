@@ -1086,9 +1086,13 @@ class Ling3Model(nn.Module):
         if targets is not None and self.linear_cross_entropy_backend == "liger":
             if loss_reduction not in self.liger_linear_cross_entropy:
                 raise ValueError("loss_reduction must be mean, sum, or none")
+            hidden_2d = x.reshape(-1, x.shape[-1])
+            # The fused loss calls F.linear directly, whereas our ordinary
+            # Linear wrapper converts its weight to the activation dtype.
+            head_weight = self.lm_head.weight.to(dtype=hidden_2d.dtype)
             return self.liger_linear_cross_entropy[loss_reduction](
-                self.lm_head.weight,
-                x.reshape(-1, x.shape[-1]),
+                head_weight,
+                hidden_2d,
                 targets.reshape(-1),
             )
 

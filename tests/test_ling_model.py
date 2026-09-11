@@ -334,7 +334,9 @@ def test_real_liger_linear_cross_entropy_matches_torch():
     actual = loss_fn(weight_liger, hidden_liger, targets)
     actual.backward()
 
-    assert torch.allclose(actual, reference, atol=2e-3, rtol=2e-3)
+    # Liger accumulates and returns the loss in FP32, while PyTorch may retain
+    # the BF16 dtype of the logits. Compare their numeric values in FP32.
+    assert torch.allclose(actual.float(), reference.float(), atol=2e-3, rtol=2e-3)
     assert torch.allclose(hidden_liger.grad, hidden_ref.grad, atol=2e-2, rtol=2e-2)
     assert torch.allclose(weight_liger.grad, weight_ref.grad, atol=2e-2, rtol=2e-2)
 

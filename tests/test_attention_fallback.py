@@ -21,6 +21,21 @@ from nanollm.engine import KVCache
 from nanollm.flash_attention import HAS_FA3, flash_attn
 
 
+def test_paged_kv_argument_supports_fa3_and_fa2_names():
+    def fa3_binding(q, k_cache, v_cache, *, page_table=None):
+        pass
+
+    def fa2_binding(q, k_cache, v_cache, *, block_table=None):
+        pass
+
+    def dense_only_binding(q, k_cache, v_cache):
+        pass
+
+    assert fa_module._paged_kv_argument(fa3_binding) == "page_table"
+    assert fa_module._paged_kv_argument(fa2_binding) == "block_table"
+    assert fa_module._paged_kv_argument(dense_only_binding) is None
+
+
 def set_impl(impl):
     """Set the implementation override ('fa3', 'sdpa', or None for auto) and re-resolve USE_FA3."""
     fa_module._override_impl = impl

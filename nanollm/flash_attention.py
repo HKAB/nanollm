@@ -13,7 +13,9 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import inspect
 import os
+import warnings
 import torch
 import torch.nn.functional as F
 
@@ -42,6 +44,28 @@ def _load_flash_attention_3():
 
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
+
+
+def _paged_kv_argument(fn):
+    """Return the paged-KV table keyword understood by an FA binding."""
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return None
+    # FA3 calls this ``page_table``. Some FA2 releases used ``block_table``.
+    if "page_table" in parameters:
+        return "page_table"
+    if "block_table" in parameters:
+        return "block_table"
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return "page_table"
+    return None
+
+
+_FA3_PAGED_KV_ARGUMENT = (
+    _paged_kv_argument(_fa3.flash_attn_with_kvcache) if HAS_FA3 else None
+)
+_WARNED_ABOUT_FA3_PAGED_KV = False
 
 # Override for testing: set to 'fa3', 'sdpa', or None (auto)
 _override_impl = None
@@ -149,11 +173,33 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if USE_FA3 and q.is_cuda:
-        return _fa3.flash_attn_with_kvcache(
-            q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
-            causal=causal, window_size=window_size, block_table=block_table
+    if USE_FA3 and q.is_cuda and (
+        block_table is None or _FA3_PAGED_KV_ARGUMENT is not None
+    ):
+        kwargs = dict(
+            k=k,
+            v=v,
+            cache_seqlens=cache_seqlens,
+            causal=causal,
+            window_size=window_size,
         )
+        # Do not pass a table keyword for a dense cache: older FA3 bindings do
+        # not declare either name, even when the value would merely be None.
+        if block_table is not None:
+            kwargs[_FA3_PAGED_KV_ARGUMENT] = block_table
+        return _fa3.flash_attn_with_kvcache(q, k_cache, v_cache, **kwargs)
+
+    if USE_FA3 and q.is_cuda and block_table is not None:
+        global _WARNED_ABOUT_FA3_PAGED_KV
+        if not _WARNED_ABOUT_FA3_PAGED_KV:
+            warnings.warn(
+                "This FlashAttention binding has no paged-KV table argument; "
+                "falling back to the correctness-first SDPA paged-cache path. "
+                "Upgrade FlashAttention for fast paged decoding.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _WARNED_ABOUT_FA3_PAGED_KV = True
 
     # Paged SDPA fallback. This is deliberately simple and correctness-first;
     # the fast CUDA path consumes the block table directly.
