@@ -1,5 +1,6 @@
 import pytest
 import torch
+from types import SimpleNamespace
 
 from scripts import chat_eval
 
@@ -25,11 +26,18 @@ class FakeEngine:
     def __init__(self, response_ids):
         self.response_ids = iter(response_ids)
 
-    def generate_batch(self, prompt, **kwargs):
-        return [[*prompt, next(self.response_ids)]], None
-
-    def generate_prompts(self, prompts, **kwargs):
-        return [[*prompt, next(self.response_ids)] for prompt in prompts]
+    def generate(self, prompts, **kwargs):
+        if prompts and isinstance(prompts[0], int):
+            prompts = [prompts]
+        num_samples = kwargs["sampling"].num_samples
+        return [
+            SimpleNamespace(
+                prompt_token_ids=prompt,
+                output_token_ids=[next(self.response_ids)],
+            )
+            for prompt in prompts
+            for _ in range(num_samples)
+        ]
 
 
 class FakeClassificationTask:

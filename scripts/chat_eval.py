@@ -23,7 +23,7 @@ from nanollm.common import (
     get_dist_info,
     print0,
 )
-from nanollm.engine import Engine
+from nanovllm import EngineConfig, LLMEngine, SamplingParams
 from tasks.sft.registry import CHAT_TASKS, create_chat_task
 
 # -----------------------------------------------------------------------------
@@ -40,17 +40,20 @@ def _generate_prompt_samples(
     temperature,
     top_k,
 ):
-    """Generate N samples per prompt through the shared packed batch engine."""
-    expanded_prompts = [
-        prompt for prompt in prompts for _ in range(num_samples)
-    ]
-    generated = engine.generate_prompts(
-        expanded_prompts,
-        batch_size=batch_size,
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
+    """Generate N samples per prompt through the shared runtime."""
+    generated = engine.generate(
+        prompts,
+        sampling=SamplingParams(
+            num_samples=num_samples,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        ),
     )
+    generated = [
+        result.prompt_token_ids + result.output_token_ids
+        for result in generated
+    ]
     return [
         generated[i:i + num_samples]
         for i in range(0, len(generated), num_samples)
@@ -156,13 +159,13 @@ def run_generative_classification_eval(
         )
         for conversation in local_conversations
     ]
-    generated = engine.generate_prompts(
+    generated = engine.generate(
         encoded_prompts,
-        batch_size=batch_size,
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
+        sampling=SamplingParams(
+            max_tokens=max_new_tokens, temperature=temperature, top_k=top_k
+        ),
     )
+    generated = [result.prompt_token_ids + result.output_token_ids for result in generated]
 
     for conversation, encoded_prompt, result in zip(
         local_conversations, encoded_prompts, generated
@@ -228,13 +231,13 @@ def run_extractive_qa_eval(
         )
         for conversation in local_conversations
     ]
-    generated = engine.generate_prompts(
+    generated = engine.generate(
         encoded_prompts,
-        batch_size=batch_size,
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
+        sampling=SamplingParams(
+            max_tokens=max_new_tokens, temperature=temperature, top_k=top_k
+        ),
     )
+    generated = [result.prompt_token_ids + result.output_token_ids for result in generated]
 
     totals = [0.0, 0.0, 0.0]  # count, exact matches, token-F1 sum
     for conversation, encoded_prompt, result in zip(
@@ -292,13 +295,13 @@ def run_hallucination_eval(
         )
         for conversation in local_conversations
     ]
-    generated = engine.generate_prompts(
+    generated = engine.generate(
         encoded_prompts,
-        batch_size=batch_size,
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
+        sampling=SamplingParams(
+            max_tokens=max_new_tokens, temperature=temperature, top_k=top_k
+        ),
     )
+    generated = [result.prompt_token_ids + result.output_token_ids for result in generated]
 
     # overall total/correct, answerable total/QA-correct/non-refusal,
     # impossible total/refused.
@@ -389,13 +392,13 @@ def run_instruction_following_eval(
         tokenizer.render_for_completion(conversation, enable_thinking=False)
         for conversation in local_conversations
     ]
-    generated = engine.generate_prompts(
+    generated = engine.generate(
         encoded_prompts,
-        batch_size=batch_size,
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
+        sampling=SamplingParams(
+            max_tokens=max_new_tokens, temperature=temperature, top_k=top_k
+        ),
     )
+    generated = [result.prompt_token_ids + result.output_token_ids for result in generated]
 
     # prompt total/correct, instruction total/correct, first strict then loose.
     counts = [0, 0, 0, 0, 0, 0]
@@ -478,13 +481,13 @@ def run_summarization_eval(
         )
         for conversation in local_conversations
     ]
-    generated = engine.generate_prompts(
+    generated = engine.generate(
         encoded_prompts,
-        batch_size=batch_size,
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
+        sampling=SamplingParams(
+            max_tokens=max_new_tokens, temperature=temperature, top_k=top_k
+        ),
     )
+    generated = [result.prompt_token_ids + result.output_token_ids for result in generated]
 
     total = 0
     precision_sum = recall_sum = f1_sum = 0.0
@@ -745,7 +748,11 @@ if __name__ == "__main__":
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
-    engine = Engine(model, tokenizer)
+    engine = LLMEngine(
+        model,
+        tokenizer,
+        EngineConfig(max_num_seqs=args.batch_size),
+    )
 
     # Get the tasks to evaluate on
     all_tasks = [task.name for task in CHAT_TASKS]

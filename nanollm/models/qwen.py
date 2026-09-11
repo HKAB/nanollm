@@ -13,6 +13,7 @@ from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from nanollm.cache import KVCache
 from nanollm.common import COMPUTE_DTYPE, get_dist_info, print0
 from nanollm.flash_attention import flash_attn
+from nanollm.inference import LayerCacheSpec, ModelCacheSpec
 from nanollm.optim import DistMuonAdamW, MuonAdamW
 
 try:
@@ -78,7 +79,7 @@ class Qwen3_5Cache(KVCache):
                 config.linear_key_head_dim,
                 config.linear_value_head_dim,
                 device=device,
-                dtype=dtype,
+                dtype=torch.float32,
             )
             for _ in range(num_layers)
         ]
@@ -243,16 +244,21 @@ class GroupedQueryAttention(nn.Module):
                 lengths = cu_seqlens[1:] - cu_seqlens[:-1]
                 if lengths.numel() != cache.batch_size:
                     raise ValueError("packed sequence count must match cache batch size")
-                k_cache, v_cache = cache.get_layer_cache(self.layer_idx)
-                cache_rows = torch.repeat_interleave(
-                    torch.arange(cache.batch_size, device=x.device), lengths
-                )
-                flat_positions = torch.arange(b * num_tokens, device=x.device)
-                cache_positions = flat_positions - torch.repeat_interleave(
-                    cu_seqlens[:-1], lengths
-                )
-                k_cache[cache_rows, cache_positions] = k_flat
-                v_cache[cache_rows, cache_positions] = v_flat
+                if getattr(cache, "is_paged", False):
+                    cache.store_packed_kv(
+                        self.layer_idx, k_flat, v_flat, cu_seqlens
+                    )
+                else:
+                    k_cache, v_cache = cache.get_layer_cache(self.layer_idx)
+                    cache_rows = torch.repeat_interleave(
+                        torch.arange(cache.batch_size, device=x.device), lengths
+                    )
+                    flat_positions = torch.arange(b * num_tokens, device=x.device)
+                    cache_positions = flat_positions - torch.repeat_interleave(
+                        cu_seqlens[:-1], lengths
+                    )
+                    k_cache[cache_rows, cache_positions] = k_flat
+                    v_cache[cache_rows, cache_positions] = v_flat
                 next_cache = cache
             else:
                 next_cache = None
@@ -267,6 +273,10 @@ class GroupedQueryAttention(nn.Module):
                 queries, k_cache, v_cache,
                 k=keys_new, v=values_new,
                 cache_seqlens=cache.cache_seqlens,
+                block_table=(
+                    cache.block_tables if getattr(cache, "is_paged", False)
+                    else None
+                ),
                 causal=True
             )
             next_cache = cache
@@ -456,6 +466,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def forward(self, hidden_states, mask=None, cos=None, sin=None, start_pos=0, cache=None, cu_seqlens=None, max_seqlen=None):
         batch_size, seq_len, _ = hidden_states.shape
         use_precomputed_states = (cache is not None and getattr(cache, 'has_previous_state', False) and seq_len == 1)
+        chunk_rule = (
+            self.chunk_gated_delta_rule
+            if hidden_states.is_cuda else torch_chunk_gated_delta_rule
+        )
+        recurrent_rule = (
+            self.recurrent_gated_delta_rule
+            if hidden_states.is_cuda else torch_recurrent_gated_delta_rule
+        )
 
         conv_state, recurrent_state = None, None
         if cache is not None:
@@ -521,18 +539,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             v = value.reshape(1, batch_size * seq_len, *value.shape[2:])
             g_f = g.reshape(1, batch_size * seq_len, *g.shape[2:])
             beta_f = beta.reshape(1, batch_size * seq_len, *beta.shape[2:])
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+            core_attn_out, last_recurrent_state = chunk_rule(
                 q, k, v, g=g_f, beta=beta_f, initial_state=None,
                 output_final_state=cache is not None,
                 use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens.to(torch.long),
             )
             core_attn_out = core_attn_out.reshape(batch_size, seq_len, *core_attn_out.shape[2:])
         elif not use_precomputed_states:
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+            core_attn_out, last_recurrent_state = chunk_rule(
                 query, key, value, g=g, beta=beta, initial_state=None, output_final_state=cache is not None, use_qk_l2norm_in_kernel=True
             )
         else:
-            core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
+            core_attn_out, last_recurrent_state = recurrent_rule(
                 query, key, value, g=g, beta=beta, initial_state=recurrent_state, output_final_state=cache is not None, use_qk_l2norm_in_kernel=True
             )
 
@@ -623,6 +641,40 @@ class Qwen3_5Model(nn.Module):
             dtype=dtype,
             config=self.config,
         )
+
+    def get_inference_cache_spec(self):
+        """Describe heterogeneous state without choosing a runtime layout."""
+        key_dim = self.config.linear_key_head_dim * self.config.linear_num_key_heads
+        value_dim = self.config.linear_value_head_dim * self.config.linear_num_value_heads
+        conv_dim = 2 * key_dim + value_dim
+        layers = []
+        for layer_idx, layer_type in enumerate(self.config.layer_types):
+            if layer_type == "full_attention":
+                layers.append(LayerCacheSpec(
+                    layer_idx=layer_idx,
+                    kind="paged_kv",
+                    num_kv_heads=self.config.n_kv_groups,
+                    key_head_dim=self.config.head_dim,
+                    value_head_dim=self.config.head_dim,
+                ))
+            elif layer_type == "linear_attention":
+                layers.append(LayerCacheSpec(
+                    layer_idx=layer_idx,
+                    kind="recurrent",
+                    recurrent_shape=(
+                        self.config.linear_num_value_heads,
+                        self.config.linear_key_head_dim,
+                        self.config.linear_value_head_dim,
+                    ),
+                    recurrent_dtype=torch.float32,
+                    convolution_shapes=((
+                        conv_dim,
+                        self.config.linear_conv_kernel_dim - 1,
+                    ),),
+                ))
+            else:
+                raise ValueError(f"unsupported inference layer type: {layer_type}")
+        return ModelCacheSpec(tuple(layers))
 
     def estimate_flops(self, global_batch_size, seq_len):
         # Estimation from: https://docs.nvidia.com/nemo/automodel/0.4.0/_modules/nemo_automodel/components/utils/flops_utils.html#qwen3_5_flops
@@ -779,7 +831,8 @@ class Qwen3_5Model(nn.Module):
                     torch.nn.init.normal_(m.A_log, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean',
-                cu_seqlens=None, position_ids=None, logit_positions=None):
+                cu_seqlens=None, position_ids=None, logit_positions=None,
+                return_hidden_states=False):
         """Run the model and optionally project only selected positions.
 
         ``logit_positions`` does not constrain generation: it only avoids the
@@ -841,13 +894,21 @@ class Qwen3_5Model(nn.Module):
                     raise ValueError("logit_positions must have shape (batch_size,)")
                 batch_indices = torch.arange(B, device=x.device)
                 x = x[batch_indices, logit_positions].unsqueeze(1)
-        logits = self.lm_head(x)
+        hidden_states = x
+        logits = self.project_logits(hidden_states)
         
         if targets is not None:
-            if self.logit_softcap > 0:
-                logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
+        if return_hidden_states:
+            return logits, hidden_states
+        return logits
+
+    def project_logits(self, hidden_states):
+        """Apply the model-specific output transformation."""
+        logits = self.lm_head(hidden_states)
+        if self.logit_softcap > 0:
+            logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         return logits
 
     @torch.inference_mode()

@@ -31,7 +31,7 @@ from nanollm.common import (
 )
 from nanollm.core_eval import evaluate_task
 from nanollm.dataloader import pretrain_loader
-from nanollm.engine import Engine
+from nanovllm import EngineConfig, LLMEngine, SamplingParams
 from nanollm.loss_eval import evaluate_loss
 from nanollm.report import get_report       
 from tasks.pretrain.core import CORE_TASKS, load_core_data
@@ -137,21 +137,30 @@ def main():
                 "Cacbon có 2 hóa trị là"
                 "Vừa gà vừa chó bó lại cho tròn 36 con 100 chân chẵn. Hỏi có bao nhiêu con gà, bao nhiêu con chó?"
             ]
-            engine = Engine(model, tokenizer)
+            engine = LLMEngine(model, tokenizer, EngineConfig(max_num_seqs=8))
             print0("\nConditioned samples:")
             for prompt in prompts:
                 tokens = tokenizer(prompt)
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-                sample_str = tokenizer.decode(sample[0])
+                sample = engine.generate(
+                    tokens, SamplingParams(max_tokens=16, temperature=0)
+                )[0]
+                sample_str = tokenizer.decode(
+                    sample.prompt_token_ids + sample.output_token_ids
+                )
                 print0("-" * 80)
                 print0(sample_str)
                 samples.append(sample_str)
 
             print0("\nUnconditioned samples:")
             tokens = tokenizer("")
-            uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
+            uncond = engine.generate(
+                tokens,
+                SamplingParams(max_tokens=128, temperature=1.0, num_samples=8),
+            )
             for sample in uncond:
-                sample_str = tokenizer.decode(sample)
+                sample_str = tokenizer.decode(
+                    sample.prompt_token_ids + sample.output_token_ids
+                )
                 print0("-" * 80)
                 print0(sample_str)
                 unconditioned_samples.append(sample_str)

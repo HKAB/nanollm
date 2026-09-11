@@ -42,7 +42,7 @@ from nanollm.common import (
     get_base_dir,
     print0,
 )
-from nanollm.engine import Engine
+from nanovllm import EngineConfig, LLMEngine, OutputSpec, SamplingParams
 from tasks.sft.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
@@ -90,7 +90,35 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanollm-rl"
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
-engine = Engine(model, tokenizer) # for sampling rollouts
+engine = LLMEngine(
+    model,
+    tokenizer,
+    EngineConfig(max_num_seqs=args.device_batch_size),
+)  # for sampling rollouts
+
+
+def generate_rollouts(
+    engine, prompt, *, num_samples, max_tokens, temperature, top_k, seed=42
+):
+    outputs = engine.generate(
+        prompt,
+        sampling=SamplingParams(
+            num_samples=num_samples,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            seed=seed,
+        ),
+        output=OutputSpec(sampled_mask=True),
+    )
+    sequences = [
+        output.prompt_token_ids + output.output_token_ids for output in outputs
+    ]
+    masks = [
+        [0] * len(output.prompt_token_ids) + output.sampled_mask.int().tolist()
+        for output in outputs
+    ]
+    return sequences, masks
 
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
@@ -121,7 +149,8 @@ def get_batch():
         num_sampling_steps = max(1, args.num_samples // args.device_batch_size) # go sequentially to prevent OOMs
         for sampling_step in range(num_sampling_steps):
             seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
-            generated_token_sequences_batch, masks_batch = engine.generate_batch(
+            generated_token_sequences_batch, masks_batch = generate_rollouts(
+                engine,
                 tokens,
                 num_samples=args.device_batch_size,
                 max_tokens=args.max_new_tokens,
@@ -160,6 +189,10 @@ def get_batch():
         # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
         mu = rewards.mean()
         advantages = rewards - mu
+        # The rollout cache can occupy most otherwise-free HBM. Drop it before
+        # yielding to the training forward/backward pass; generate() rebuilds
+        # it lazily for the next rollout.
+        engine.release_cache()
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
         yield generated_token_sequences, inputs, targets, rewards, advantages
 
@@ -185,7 +218,8 @@ def run_gsm8k_eval(task, tokenizer, engine,
         prefix_length = len(tokens)
         # Generate k samples using batched generation inside the Engine
         assert num_samples <= args.device_batch_size # usually this is true. we can add a loop if not...
-        generated_token_sequences, masks = engine.generate_batch(
+        generated_token_sequences, masks = generate_rollouts(
+            engine,
             tokens,
             num_samples=num_samples,
             max_tokens=max_completion_tokens,
@@ -245,6 +279,7 @@ for step in range(num_steps):
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
         records_iter = run_gsm8k_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0)
         records = list(records_iter) # collect all records
+        engine.release_cache()
         for k in range(1, args.device_batch_size + 1):
             passk[k - 1] = sum(any(o["is_correct"] for o in r["outcomes"][:k]) for r in records)
         num_records = torch.tensor(len(records), dtype=torch.long, device=device)
@@ -316,6 +351,7 @@ for step in range(num_steps):
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
     optimizer.step()
+    engine.notify_weights_updated()
     model.zero_grad(set_to_none=True)
     wandb_run.log({
         "step": step,

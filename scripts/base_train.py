@@ -61,7 +61,7 @@ from nanollm.dataloader import (
     pretrain_loader,
     pretrain_loader_with_state,
 )
-from nanollm.engine import Engine
+from nanovllm import EngineConfig, LLMEngine, SamplingParams
 from nanollm.report import get_report
 from nanollm.flash_attention import HAS_FA3
 from nanollm.loss_eval import evaluate_loss
@@ -563,12 +563,19 @@ while True:
             "Cacbon có 2 hóa trị là",
             "Vừa gà vừa chó bó lại cho tròn 36 con 100 chân chẵn. Hỏi có bao nhiêu con gà, bao nhiêu con chó?"
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        engine = LLMEngine(
+            orig_model, tokenizer, EngineConfig(max_num_seqs=1)
+        )  # use orig_model to avoid recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt)
             with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+                sample = engine.generate(
+                    tokens, SamplingParams(max_tokens=16, temperature=0)
+                )[0]
+            print0(tokenizer.decode(
+                sample.prompt_token_ids + sample.output_token_ids
+            ))
+        engine.release_cache()
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step

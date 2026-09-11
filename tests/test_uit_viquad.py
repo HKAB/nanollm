@@ -105,11 +105,15 @@ def test_hallucination_runner_reports_balanced_metrics(monkeypatch):
         def __init__(self):
             self.responses = iter([7, 8])
 
-        def generate_batch(self, prompt, **kwargs):
-            return [[*prompt, next(self.responses)]], None
-
-        def generate_prompts(self, prompts, **kwargs):
-            return [[*prompt, next(self.responses)] for prompt in prompts]
+        def generate(self, prompts, **kwargs):
+            from types import SimpleNamespace
+            return [
+                SimpleNamespace(
+                    prompt_token_ids=prompt,
+                    output_token_ids=[next(self.responses)],
+                )
+                for prompt in prompts
+            ]
 
     monkeypatch.setattr(chat_eval, "get_dist_info", lambda: (False, 0, 0, 1))
     monkeypatch.setattr(chat_eval, "print0", lambda *args, **kwargs: None)

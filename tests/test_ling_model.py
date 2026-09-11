@@ -10,6 +10,7 @@ import nanollm.models.ling as ling_module
 from nanollm.models.ling import Ling3Model, Ling3ModelConfig
 from nanollm.models.registry import get_model_entry, map_hf_config, map_hf_state_dict
 from nanollm.tokenizers.ling_tokenizer import LingTokenizer
+from nanovllm import EngineConfig, LLMEngine, OutputSpec, SamplingParams
 
 
 @pytest.fixture(autouse=True)
@@ -158,6 +159,37 @@ def test_cached_decode_matches_full_forward():
 
     assert cache.cache_seqlens.tolist() == [4]
     assert torch.allclose(cached_last[:, -1], full[:, -1], atol=1e-5, rtol=1e-5)
+
+
+def test_nanovllm_runs_ling_cache_and_returns_sampling_hidden_states():
+    model = make_model()
+
+    class Tokenizer:
+        eos_token_id = 63
+
+    engine = LLMEngine(
+        model,
+        Tokenizer(),
+        EngineConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=16,
+            block_size=2,
+            num_kv_blocks=16,
+        ),
+    )
+    outputs = engine.generate(
+        [[1, 2, 3], [4, 5]],
+        SamplingParams(max_tokens=2, temperature=0),
+        OutputSpec(hidden_states=True),
+    )
+
+    assert len(outputs) == 2
+    assert all(len(output.output_token_ids) == 2 for output in outputs)
+    assert all(
+        output.sampling_hidden_states.shape == (2, 32)
+        for output in outputs
+    )
+    assert model.project_logits(outputs[0].sampling_hidden_states).shape == (2, 64)
 
 
 def test_packed_forward_matches_independent_sequences():

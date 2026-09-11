@@ -17,6 +17,7 @@ from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 from nanollm.common import COMPUTE_DTYPE, get_dist_info, print0
 from nanollm.flash_attention import flash_attn
+from nanollm.inference import LayerCacheSpec, ModelCacheSpec
 from nanollm.optim import DistMuonAdamW, MuonAdamW
 
 try:
@@ -480,12 +481,15 @@ class MultiLatentAttention(nn.Module):
             out = out.view(b, t, cfg.n_heads, cfg.qk_head_dim)
             if cache is not None:
                 lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-                kc, vc = cache.get_layer_cache(self.layer_idx)
-                rows = torch.repeat_interleave(torch.arange(cache.batch_size, device=x.device), lengths)
-                flat = torch.arange(b * t, device=x.device)
-                positions = flat - torch.repeat_interleave(cu_seqlens[:-1], lengths)
-                kc[rows, positions] = kf
-                vc[rows, positions] = vf
+                if getattr(cache, "is_paged", False):
+                    cache.store_packed_kv(self.layer_idx, kf, vf, cu_seqlens)
+                else:
+                    kc, vc = cache.get_layer_cache(self.layer_idx)
+                    rows = torch.repeat_interleave(torch.arange(cache.batch_size, device=x.device), lengths)
+                    flat = torch.arange(b * t, device=x.device)
+                    positions = flat - torch.repeat_interleave(cu_seqlens[:-1], lengths)
+                    kc[rows, positions] = kf
+                    vc[rows, positions] = vf
         elif cache is None:
             out = flash_attn.flash_attn_func(q, key, value_padded, causal=True)
         else:
@@ -493,6 +497,10 @@ class MultiLatentAttention(nn.Module):
             out = flash_attn.flash_attn_with_kvcache(
                 q, kc, vc, k=key, v=value_padded,
                 cache_seqlens=cache.cache_seqlens, causal=True,
+                block_table=(
+                    cache.block_tables if getattr(cache, "is_paged", False)
+                    else None
+                ),
             )
         out = out[..., :cfg.v_head_dim]
         if self.g_proj is not None:
@@ -870,6 +878,33 @@ class Ling3Model(nn.Module):
             self.config, batch_size, seq_len, self.get_device(), dtype
         )
 
+    def get_inference_cache_spec(self):
+        """Describe Ling's MLA pages and KDA sequence state."""
+        cfg = self.config
+        conv_shape = (
+            cfg.n_heads * cfg.head_dim,
+            cfg.short_conv_kernel_size - 1,
+        )
+        layers = []
+        for layer_idx in range(cfg.n_layers):
+            if _is_full_attention(cfg, layer_idx):
+                layers.append(LayerCacheSpec(
+                    layer_idx=layer_idx,
+                    kind="paged_kv",
+                    num_kv_heads=cfg.n_heads,
+                    key_head_dim=cfg.qk_head_dim,
+                    value_head_dim=cfg.qk_head_dim,
+                ))
+            else:
+                layers.append(LayerCacheSpec(
+                    layer_idx=layer_idx,
+                    kind="recurrent",
+                    recurrent_shape=(cfg.n_heads, cfg.head_dim, cfg.head_dim),
+                    convolution_shapes=(conv_shape, conv_shape, conv_shape),
+                    recurrent_dtype=torch.float32,
+                ))
+        return ModelCacheSpec(tuple(layers))
+
     def num_scaling_params(self):
         wte = self.transformer.wte.weight.numel()
         lm_head = self.lm_head.weight.numel()
@@ -1007,7 +1042,8 @@ class Ling3Model(nn.Module):
         self._reset_runtime_buffers()
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean",
-                cu_seqlens=None, position_ids=None, logit_positions=None):
+                cu_seqlens=None, position_ids=None, logit_positions=None,
+                return_hidden_states=False):
         b, t = idx.shape
         if targets is not None and logit_positions is not None:
             raise ValueError("logit_positions cannot be used when targets are provided")
@@ -1056,12 +1092,19 @@ class Ling3Model(nn.Module):
                 targets.reshape(-1),
             )
 
-        logits = self.lm_head(x)
+        hidden_states = x
+        logits = self.project_logits(hidden_states)
         if targets is not None:
-            if self.logit_softcap > 0:
-                logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
             return F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]), targets.reshape(-1),
                 ignore_index=-1, reduction=loss_reduction,
             )
+        if return_hidden_states:
+            return logits, hidden_states
+        return logits
+
+    def project_logits(self, hidden_states):
+        logits = self.lm_head(hidden_states)
+        if self.logit_softcap > 0:
+            logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         return logits

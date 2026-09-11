@@ -48,7 +48,7 @@ from nanollm.common import (
     print0,
 )
 from nanollm.dataloader import sft_loader, sft_pretokenized_loader
-from nanollm.engine import Engine
+from nanovllm import EngineConfig, LLMEngine, SamplingParams
 from nanollm.flash_attention import HAS_FA3
 from nanollm.loss_eval import evaluate_loss
 from scripts.chat_eval import run_chat_eval
@@ -316,7 +316,11 @@ while True:
     # ChatCORE metric
     if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
         model.eval()
-        engine = Engine(orig_model, tokenizer)
+        engine = LLMEngine(
+            orig_model,
+            tokenizer,
+            EngineConfig(max_num_seqs=args.chatcore_batch_size),
+        )
         
         task_results = {}
         task_metrics = {}
@@ -371,6 +375,7 @@ while True:
             **all_metric_logs,
             **timing_logs,
         })
+        engine.release_cache()
         model.train()
 
     # Periodic qualitative samples. Only rank 0 generates, then all ranks wait
@@ -408,16 +413,22 @@ while True:
                 )
                 for conversation in sample_conversations
             ]
-            sample_engine = Engine(orig_model, tokenizer)
-            samples = sample_engine.generate_prompts(
+            sample_engine = LLMEngine(
+                orig_model,
+                tokenizer,
+                EngineConfig(max_num_seqs=len(sample_prompts)),
+            )
+            samples = sample_engine.generate(
                 sample_prompts,
-                batch_size=len(sample_prompts),
-                max_tokens=args.sample_max_tokens,
-                temperature=0.0,
+                SamplingParams(
+                    max_tokens=args.sample_max_tokens,
+                    temperature=0.0,
+                ),
             )
             for index, (prompt, sample) in enumerate(zip(sample_prompts, samples), 1):
-                completion = tokenizer.decode(sample[len(prompt):])
+                completion = tokenizer.decode(sample.output_token_ids)
                 print0(f"Step {step:05d} | sample {index}: {completion}")
+            sample_engine.release_cache()
             orig_model.train()
         if ddp:
             dist.barrier()

@@ -8,7 +8,7 @@ import argparse
 
 from nanollm.checkpoint_manager import load_model
 from nanollm.common import autodetect_device_type, compute_init
-from nanollm.engine import Engine
+from nanovllm import EngineConfig, LLMEngine, SamplingParams
 
 parser = argparse.ArgumentParser(description='Chat with the model')
 parser.add_argument('-i', '--source', type=str, default="pretrained", help="Source of the model: sft|rl|pretrained")
@@ -42,7 +42,7 @@ def safe_append(lst, val):
 
 
 # Create Engine for efficient generation
-engine = Engine(model, tokenizer)
+engine = LLMEngine(model, tokenizer, EngineConfig(max_num_seqs=1))
 
 print("\nNanoChat Interactive Mode")
 print("-" * 50)
@@ -93,20 +93,17 @@ while True:
     else:
         conversation_tokens.extend(tokenizer.encode("<think>\n\n</think>\n\n"))
 
-    generate_kwargs = {
-        "num_samples": 1,
-        "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-        "top_k": args.top_k,
-    }
-    response_tokens = []
+    result = engine.generate(
+        conversation_tokens,
+        SamplingParams(
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        ),
+    )[0]
+    response_tokens = result.output_token_ids
     print("\nAssistant: ", end="", flush=True)
-    for token_column, token_masks in engine.generate(conversation_tokens, **generate_kwargs):
-        token = token_column[0]
-        response_tokens.append(token)
-        token_text = tokenizer.decode([token])
-        print(token_text, end="", flush=True)
-    print()
+    print(tokenizer.decode(response_tokens))
     # Ensure the turn ends with <|im_end|>\n
     if im_end is not None and (not response_tokens or response_tokens[-1] != im_end):
         response_tokens.append(im_end)

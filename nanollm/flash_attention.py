@@ -132,7 +132,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
-                            causal=False, window_size=(-1, -1)):
+                            causal=False, window_size=(-1, -1), block_table=None):
     """
     Flash Attention with KV cache for inference.
 
@@ -152,8 +152,41 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     if USE_FA3 and q.is_cuda:
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
-            causal=causal, window_size=window_size
+            causal=causal, window_size=window_size, block_table=block_table
         )
+
+    # Paged SDPA fallback. This is deliberately simple and correctness-first;
+    # the fast CUDA path consumes the block table directly.
+    if block_table is not None:
+        rows = []
+        page_size = k_cache.size(1)
+        for row in range(q.size(0)):
+            pos = int(cache_seqlens[row].item())
+            num_new = q.size(1)
+            for offset in range(num_new):
+                logical = pos + offset
+                physical = int(block_table[row, logical // page_size].item())
+                within = logical % page_size
+                if k is not None and v is not None:
+                    k_cache[physical, within].copy_(k[row, offset])
+                    v_cache[physical, within].copy_(v[row, offset])
+            end = pos + num_new
+            num_pages = (end + page_size - 1) // page_size
+            physical_ids = block_table[row, :num_pages].long()
+            k_full = k_cache.index_select(0, physical_ids).flatten(0, 1)[:end]
+            v_full = v_cache.index_select(0, physical_ids).flatten(0, 1)[:end]
+            q_row = q[row:row + 1].transpose(1, 2)
+            k_row = k_full.unsqueeze(0).transpose(1, 2)
+            v_row = v_full.unsqueeze(0).transpose(1, 2)
+            y = _sdpa_attention(
+                q_row,
+                k_row,
+                v_row,
+                window_size,
+                q_row.size(1) != k_row.size(1),
+            )
+            rows.append(y.transpose(1, 2))
+        return torch.cat(rows, dim=0)
 
     # SDPA fallback: manually manage KV cache
     B, T_new, H, D = q.shape
