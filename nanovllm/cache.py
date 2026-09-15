@@ -29,6 +29,7 @@ class PagedModelCache:
         max_num_seqs: int,
         block_size: int,
         num_kv_blocks: int | None,
+        kv_cache_memory_gib: float | None = None,
         gpu_memory_utilization: float,
     ):
         get_spec = getattr(model, "get_inference_cache_spec", None)
@@ -84,9 +85,12 @@ class PagedModelCache:
             for layer in paged_layers
         )
         if num_kv_blocks is None:
-            if self.device.type != "cuda":
+            if bytes_per_block == 0:
                 num_kv_blocks = max_num_seqs
-            elif bytes_per_block == 0:
+            elif kv_cache_memory_gib is not None:
+                cache_bytes = int(kv_cache_memory_gib * 1024**3)
+                num_kv_blocks = cache_bytes // bytes_per_block
+            elif self.device.type != "cuda":
                 num_kv_blocks = max_num_seqs
             else:
                 free, total = torch.cuda.mem_get_info(self.device)

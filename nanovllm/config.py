@@ -52,6 +52,7 @@ class EngineConfig:
     num_kv_blocks: int | None = None
     gpu_memory_utilization: float = 0.90
     enable_prefix_caching: bool = False
+    kv_cache_memory_gib: float | None = None
 
     def __post_init__(self):
         if self.max_num_seqs <= 0:
@@ -62,5 +63,11 @@ class EngineConfig:
             raise ValueError("block_size must be positive")
         if self.num_kv_blocks is not None and self.num_kv_blocks <= 0:
             raise ValueError("num_kv_blocks must be positive")
+        if self.kv_cache_memory_gib is not None and self.kv_cache_memory_gib <= 0:
+            raise ValueError("kv_cache_memory_gib must be positive")
+        if self.num_kv_blocks is not None and self.kv_cache_memory_gib is not None:
+            raise ValueError(
+                "num_kv_blocks and kv_cache_memory_gib are mutually exclusive"
+            )
         if not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError("gpu_memory_utilization must be in (0, 1]")

@@ -115,6 +115,16 @@ def test_hybrid_prefix_cache_cannot_be_enabled_incompletely():
         )
 
 
+def test_kv_cache_size_options_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        EngineConfig(num_kv_blocks=4, kv_cache_memory_gib=1.0)
+
+
+def test_kv_cache_memory_gib_must_be_positive():
+    with pytest.raises(ValueError, match="must be positive"):
+        EngineConfig(kv_cache_memory_gib=0)
+
+
 class RecurrentSpecModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -129,12 +139,41 @@ class RecurrentSpecModel(nn.Module):
         ),))
 
 
+class PagedSpecModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+
+    def get_inference_cache_spec(self):
+        return ModelCacheSpec((LayerCacheSpec(
+            layer_idx=0,
+            kind="paged_kv",
+            num_kv_heads=1,
+            key_head_dim=1,
+            value_head_dim=1,
+        ),))
+
+
+def test_kv_cache_memory_gib_is_converted_to_whole_blocks():
+    # float32, two tokens per block, one K and one V element per token = 16 bytes.
+    cache = PagedModelCache(
+        PagedSpecModel(),
+        max_num_seqs=1,
+        block_size=2,
+        num_kv_blocks=None,
+        kv_cache_memory_gib=(3 * 16) / 1024**3,
+        gpu_memory_utilization=0.9,
+    )
+    assert cache.num_kv_blocks == 3
+
+
 def test_recurrent_rows_are_gathered_and_committed_by_stable_slot():
     cache = PagedModelCache(
         RecurrentSpecModel(),
         max_num_seqs=3,
         block_size=2,
         num_kv_blocks=2,
+        kv_cache_memory_gib=None,
         gpu_memory_utilization=0.9,
     )
     first = cache.allocate_slot()

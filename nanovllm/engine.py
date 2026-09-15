@@ -51,6 +51,7 @@ class LLMEngine:
             max_num_seqs=self.config.max_num_seqs,
             block_size=self.config.block_size,
             num_kv_blocks=self.config.num_kv_blocks,
+            kv_cache_memory_gib=self.config.kv_cache_memory_gib,
             gpu_memory_utilization=self.config.gpu_memory_utilization,
         )
         self.block_manager = BlockManager(

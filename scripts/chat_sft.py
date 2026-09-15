@@ -107,6 +107,12 @@ parser.add_argument(
     help="maximum new tokens for each periodic chat sample",
 )
 parser.add_argument(
+    "--inference-kv-cache-gib",
+    type=float,
+    default=4.0,
+    help="GPU memory reserved for the paged KV cache during ChatCORE and sampling",
+)
+parser.add_argument(
     "--save-every",
     type=int,
     default=-1,
@@ -117,6 +123,7 @@ args = parser.parse_args()
 assert args.num_iterations > 0, "--num-iterations must be > 0"
 assert args.chatcore_batch_size > 0, "--chatcore-batch-size must be > 0"
 assert args.sample_max_tokens > 0, "--sample-max-tokens must be > 0"
+assert args.inference_kv_cache_gib > 0, "--inference-kv-cache-gib must be > 0"
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
@@ -274,6 +281,15 @@ def unpack_batch(batch):
     x, y = batch
     return x, y, None, None
 
+
+def reclaim_training_cache():
+    """Return unused training allocations to CUDA before inference starts."""
+    gc.collect()
+    if device_type == "cuda":
+        synchronize()
+        torch.cuda.empty_cache()
+
+
 x, y, cu_seqlens, position_ids = unpack_batch(next(train_loader))
 min_val_loss    = float("inf")
 last_val_loss   = None
@@ -316,10 +332,14 @@ while True:
     # ChatCORE metric
     if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
         model.eval()
+        reclaim_training_cache()
         engine = LLMEngine(
             orig_model,
             tokenizer,
-            EngineConfig(max_num_seqs=args.chatcore_batch_size),
+            EngineConfig(
+                max_num_seqs=args.chatcore_batch_size,
+                kv_cache_memory_gib=args.inference_kv_cache_gib,
+            ),
         )
         
         task_results = {}
@@ -413,10 +433,14 @@ while True:
                 )
                 for conversation in sample_conversations
             ]
+            reclaim_training_cache()
             sample_engine = LLMEngine(
                 orig_model,
                 tokenizer,
-                EngineConfig(max_num_seqs=len(sample_prompts)),
+                EngineConfig(
+                    max_num_seqs=len(sample_prompts),
+                    kv_cache_memory_gib=args.inference_kv_cache_gib,
+                ),
             )
             samples = sample_engine.generate(
                 sample_prompts,
