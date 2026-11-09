@@ -24,17 +24,25 @@ from datasets import load_dataset
 
 
 GSM_RE = re.compile(r"####\s*(\-?[0-9\.,]+)")
+BOXED_RE = re.compile(r"\\boxed\{\s*(-?[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)\s*\}")
+FORMAT_INSTRUCTIONS = (
+    r"Put your reasoning inside <think> and </think> tags. "
+    r"After </think>, put only the final numeric answer in \boxed{...}."
+)
 MAX_NEW_TOKENS = 256
 
 
 def extract_answer(completion: str) -> str | None:
-    """Extract the normalized numeric answer after the `####` marker.
+    """Extract the final boxed number or the original GSM8K answer marker.
 
     Follows the official GSM8K normalization convention:
     https://github.com/openai/grade-school-math/blob/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/dataset.py#L28
     """
     if not isinstance(completion, str):
         return None
+    boxed = BOXED_RE.findall(completion)
+    if boxed:
+        return boxed[-1].replace(",", "")
     match = GSM_RE.search(completion)
     if match is None:
         return None
@@ -64,6 +72,7 @@ class GSM8K:
         shuffle: bool = True,
         seed: int = 42,
         think_bonus: float = 0.1,
+        format_prompt: bool = False,
     ):
         if subset not in {"main", "socratic"}:
             raise ValueError("GSM8K subset must be 'main' or 'socratic'")
@@ -77,6 +86,7 @@ class GSM8K:
             ds = ds.select(range(min(limit, len(ds))))
         self.ds = ds
         self.think_bonus = think_bonus
+        self.format_prompt = format_prompt
 
     def __len__(self) -> int:
         return len(self.ds)
@@ -95,6 +105,9 @@ class GSM8K:
         if final_answer is None:
             raise ValueError(f"Could not extract GSM8K answer at index {index}")
 
+        if self.format_prompt:
+            question = f"{question}\n\n{FORMAT_INSTRUCTIONS}"
+
         messages = [
             {"role": "user", "content": question},
             {"role": "assistant", "content": answer},
@@ -112,7 +125,7 @@ class GSM8K:
         if ref_num is None:
             assistant_message = conversation["messages"][-1]
             ref_num = extract_answer(assistant_message["content"])
-        pred_num = extract_answer(assistant_response)
+        pred_num = extract_answer(assistant_response.rsplit("</think>", 1)[-1])
         return pred_num is not None and pred_num == ref_num
 
     def reward(self, conversation: dict[str, Any], assistant_response: str) -> float:

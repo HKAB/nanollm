@@ -141,8 +141,10 @@ class LingTokenizer(Tokenizer):
         conversation = copy.deepcopy(conversation)
         if conversation["messages"] and conversation["messages"][-1]["role"] == "assistant":
             conversation["messages"].pop()
-        conversation["enable_thinking"] = enable_thinking
+        conversation["enable_thinking"] = True if enable_thinking is None else enable_thinking
         ids, _ = self.render_conversation(conversation, max_tokens=max_tokens)
-        ids.extend(self.encode("<role>ASSISTANT</role>\n<think>" if enable_thinking
-                               else "<role>ASSISTANT</role>\n<think></think>"))
+        assistant_prefix = "<role>ASSISTANT</role>\n"
+        if enable_thinking is not None:
+            assistant_prefix += "<think>" if enable_thinking else "<think></think>"
+        ids.extend(self.encode(assistant_prefix))
         return ids[:max_tokens]

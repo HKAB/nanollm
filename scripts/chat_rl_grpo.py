@@ -13,6 +13,7 @@ import copy
 import itertools
 import math
 import os
+import re
 import sys
 from contextlib import contextmanager
 from time import perf_counter
@@ -77,6 +78,8 @@ def main():
     parser = argparse.ArgumentParser(description="Clipped group-relative policy optimization")
     # Logging
     parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+    parser.add_argument("--sample-every", type=int, default=5, help="log one training rollout on rounds 1, N, 2N, ... (0 disables)")
+    parser.add_argument("--sample-max-chars", type=int, default=800, help="maximum displayed characters per sample field")
     # Runtime
     parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
     # Model loading
@@ -123,6 +126,8 @@ def main():
         parser.error("max-steps must be positive")
     if args.hf_model and (args.model_tag is not None or args.model_step is not None):
         parser.error("--hf-model cannot be combined with --model-tag or --model-step")
+    if args.sample_every < 0 or args.sample_max_chars < 1:
+        parser.error("sample-every must be nonnegative and sample-max-chars must be positive")
     user_config = vars(args).copy()
     # -----------------------------------------------------------------------------
 
@@ -152,17 +157,17 @@ def main():
 
     def render_prompt(conversation):
         if not args.hf_model:
-            return tokenizer.render_for_completion(conversation)
+            return tokenizer.render_for_completion(conversation, enable_thinking=None)
         if tokenizer.chat_template:
-            return tokenizer.apply_chat_template(
-                conversation["messages"][:-1], tokenize=True, add_generation_prompt=True,
+            text = tokenizer.apply_chat_template(
+                conversation["messages"][:-1], tokenize=False, add_generation_prompt=True,
             )
-        # Qwen3 Base ships without a chat template.
-        question = conversation["messages"][-2]["content"]
-        return tokenizer.encode(
-            f"Question: {question}\nShow your reasoning in <think> tags and finish with #### followed by the number.\nAnswer: <think>\n",
-            add_special_tokens=False,
-        )
+            # Qwen templates can prefill an opening tag or an empty reasoning block.
+            text = re.sub(r"<think>\s*(?:</think>\s*)?\Z", "", text)
+        else:
+            question = conversation["messages"][-2]["content"]
+            text = f"Question: {question}\nAnswer: "
+        return tokenizer.encode(text, add_special_tokens=False)
 
 
     def policy_logits(inputs):
@@ -224,8 +229,8 @@ def main():
             output=OutputSpec(logprobs=logprobs),
         )
 
-    train_task = GSM8K(subset="main", split="train")
-    val_task = GSM8K(subset="main", split="test") if args.eval_every > 0 and args.eval_examples > 0 else None
+    train_task = GSM8K(subset="main", split="train", format_prompt=True)
+    val_task = GSM8K(subset="main", split="test", format_prompt=True) if args.eval_every > 0 and args.eval_examples > 0 else None
     num_steps = (len(train_task) // args.rollout_prompts) * args.num_epochs
     if args.max_steps is not None:
         num_steps = min(num_steps, args.max_steps)
@@ -265,9 +270,10 @@ def main():
 
 
     @torch.no_grad()
-    def collect_rollouts(round_idx, rank_indices, timings):
+    def collect_rollouts(round_idx, rank_indices, timings, *, log_sample=False):
         sequences, old_logprobs, rewards, advantages = [], [], [], []
-        for _ in range(prompts_per_rank):
+        sample = None
+        for prompt_idx in range(prompts_per_rank):
             example_idx = next(rank_indices)
             conversation = train_task[example_idx]
             prompt = render_prompt(conversation)
@@ -283,10 +289,16 @@ def main():
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                 with measure_phase(timings, "reward"):
-                    group_rewards.extend(
-                        train_task.reward(conversation, tokenizer.decode(output.output_token_ids))
-                        for output in outputs
-                    )
+                    completions = [tokenizer.decode(output.output_token_ids) for output in outputs]
+                    group_rewards.extend(train_task.reward(conversation, text) for text in completions)
+                if log_sample and prompt_idx == 0 and offset == 0:
+                    sample = {
+                        "example": example_idx,
+                        "prompt": conversation["completion_prompt"],
+                        "completion": completions[0],
+                        "expected_answer": conversation.get("answer", ""),
+                        "completion_tokens": len(outputs[0].output_token_ids),
+                    }
                 for output in outputs:
                     sequences.append(torch.tensor(prompt + output.output_token_ids, device=device))
                     old_logprobs.append(output.token_logprobs)
@@ -296,7 +308,7 @@ def main():
             advantages.append((group_rewards - group_rewards.mean()) / (group_rewards.std(unbiased=False) + 1e-4))
 
         release_rollout_cache()
-        return sequences, old_logprobs, torch.cat(rewards), torch.cat(advantages)
+        return sequences, old_logprobs, torch.cat(rewards), torch.cat(advantages), sample
 
     def collate_rollouts(sequences, old_logprobs, indices):
         inputs = [sequences[i][:-1] for i in indices]
@@ -376,7 +388,13 @@ def main():
             })
 
         timings = {name: [] for name in ("rollout", "reward", "forward", "backward")}
-        sequences, old_logprobs, rewards, advantages = collect_rollouts(step, rank_indices, timings)
+        round_number = step + 1
+        log_sample = master_process and args.sample_every > 0 and (
+            round_number == 1 or round_number % args.sample_every == 0
+        )
+        sequences, old_logprobs, rewards, advantages, sample = collect_rollouts(
+            step, rank_indices, timings, log_sample=log_sample,
+        )
         num_rollouts = len(sequences)
         metrics = torch.zeros(2, device=device)
         lrm = get_lr_multiplier(step)
@@ -432,8 +450,27 @@ def main():
         }
         timing_logs = summarize_timings(timings)
         logs.update(timing_logs)
-        timing_text = " | ".join(f"{name}: {timing_logs[f'timing/{name}_max_s']:.3f}s" for name in timings)
-        print0(f"Round {step}/{num_steps} | reward: {reward:.4f} | entropy: {entropy:.4f} | {timing_text}")
+        timing_text = " | ".join(f"{name} time: {timing_logs[f'timing/{name}_max_s']:.3f}s" for name in timings)
+        print0(f"Round {step}/{num_steps} | loss: {loss:.6f} | reward: {reward:.4f} | entropy: {entropy:.4f} | {timing_text}")
+        if sample is not None:
+            for field in ("prompt", "completion", "expected_answer"):
+                value = str(sample[field])
+                if len(value) > args.sample_max_chars:
+                    budget = args.sample_max_chars - 1
+                    tail = budget // 2 if field == "completion" else 0
+                    value = value[:budget - tail] + "…" + value[len(value) - tail:]
+                sample[field] = value
+            sample["reward"] = rewards[0].item()
+            sample["advantage"] = advantages[0].item()
+            print0(
+                f"Rollout sample | round {step} | example {sample['example']} "
+                f"| tokens: {sample['completion_tokens']} | expected: {sample['expected_answer']!r} "
+                f"| reward: {sample['reward']:.4f} | advantage: {sample['advantage']:.4f}\n"
+                f"  Prompt: {sample['prompt']!r}\n"
+                f"  Completion: {sample['completion']!r}"
+            )
+            if not use_dummy_wandb:
+                logs["rollout/sample"] = wandb.Table(columns=list(sample), data=[list(sample.values())])
         wandb_run.log(logs)
 
         # Master process saves the model once in a while. Skip first step. Save last step.

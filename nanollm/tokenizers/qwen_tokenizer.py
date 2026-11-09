@@ -217,6 +217,7 @@ class QwenTokenizer(Tokenizer):
         return ids, mask
 
     def render_for_completion(self, conversation, enable_thinking=True, max_tokens=2048):
+        """Use enable_thinking=None to leave reasoning tags to the model."""
         conversation = copy.deepcopy(conversation)
         messages = conversation["messages"]
         assert messages[-1]["role"] == "assistant"
@@ -230,6 +231,6 @@ class QwenTokenizer(Tokenizer):
         ids.extend(self.encode("assistant\n"))
         if enable_thinking:
             ids.extend(self.encode("<think>\n"))
-        else:
+        elif enable_thinking is not None:
             ids.extend(self.encode("<think>\n\n</think>\n\n"))
         return ids

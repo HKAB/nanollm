@@ -30,6 +30,17 @@ def test_task_reward_accounts_for_prefill():
     assert task.reward(conversation, "</think>\n#### 42") == 1.0
 
 
+@pytest.mark.parametrize("completion, correct", [
+    (r"<think>48 / 3 = 16</think>\boxed{16}<|im_end|>", True),
+    (r"<think>\boxed{16}</think>\boxed{15}", False),
+    (r"<think>\boxed{16}</think>", False),
+    ("#### 16", True),
+])
+def test_gsm8k_extracts_final_answer_after_reasoning(completion, correct):
+    task = GSM8K.__new__(GSM8K)
+    assert task.evaluate({"answer": "16"}, completion) is correct
+
+
 @pytest.mark.parametrize("ratio_level", ["sequence", "sequence-sum", "token"])
 def test_clipped_objective_uses_frozen_logprobs(ratio_level):
     logits = torch.zeros(4, 3, 2, requires_grad=True)
