@@ -23,6 +23,7 @@ exec "${TORCHRUN:-.venv/bin/torchrun}" --standalone --nproc_per_node="${NPROC_PE
     --rollout-prompts 16 \
     --num-samples 8 \
     --minibatch-size 16 \
+    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-16}" \
     --device-batch-size 4 \
     --max-new-tokens 256 \
     --max-steps 100 \

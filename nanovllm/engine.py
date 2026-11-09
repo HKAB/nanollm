@@ -126,6 +126,7 @@ class LLMEngine:
                 generators[request.request_id] = generator
 
         eos_ids = self._eos_ids()
+        decode_steps = decode_tokens = 0
         try:
             while not self.scheduler.is_finished():
                 batch = self.scheduler.schedule_prefill()
@@ -135,6 +136,8 @@ class LLMEngine:
                     batch = self.scheduler.schedule_decode()
                     if not batch:
                         raise RuntimeError("no request can make progress")
+                    decode_steps += 1
+                    decode_tokens += len(batch)
                     logits, hidden = self.runner.decode(batch)
 
                 token_ids, logprobs = sample(logits, batch, generators)
@@ -194,6 +197,8 @@ class LLMEngine:
             "num_sequences": len(requests),
             "prompt_tokens": sum(len(request.prompt_token_ids) for request in requests),
             "generated_tokens": sum(generated_lengths),
+            "decode_steps": decode_steps,
+            "decode_tokens": decode_tokens,
             "average_prompt_tokens": (
                 sum(len(request.prompt_token_ids) for request in requests)
                 / len(requests)

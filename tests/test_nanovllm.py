@@ -226,3 +226,22 @@ def test_qwen_hybrid_rollout_with_fp32_weights_and_bf16_activations(monkeypatch)
     conv_grad = model.transformer.h[0].linear_attn.conv1d.weight.grad
     assert conv_grad.dtype == torch.float32
     assert torch.isfinite(conv_grad).all() and conv_grad.count_nonzero() > 0
+
+
+def test_queued_prompt_groups_keep_output_order_across_decode_batches():
+    engine = LLMEngine(
+        TinyModel(), TinyTokenizer(),
+        EngineConfig(max_num_seqs=3, block_size=2, num_kv_blocks=12),
+    )
+    outputs = engine.generate(
+        [[1], [3], [5]],
+        SamplingParams(num_samples=2, max_tokens=2, temperature=1, top_k=1, ignore_eos=True),
+        OutputSpec(logprobs=True),
+    )
+    assert [output.prompt_token_ids for output in outputs] == [[1], [1], [3], [3], [5], [5]]
+    assert [output.output_token_ids for output in outputs] == [
+        [2, 3], [2, 3], [4, 5], [4, 5], [6, 7], [6, 7],
+    ]
+    assert all(torch.equal(output.token_logprobs, torch.zeros(2)) for output in outputs)
+    assert engine.last_generation_stats["decode_steps"] == 2
+    assert engine.last_generation_stats["decode_tokens"] == 6

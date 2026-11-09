@@ -97,6 +97,8 @@ def main():
     parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over GSM8K")
     # Batch sizes / sampling
     parser.add_argument("--device-batch-size", type=int, default=8, help="max batch size per forward pass")
+    parser.add_argument("--rollout-batch-size", type=int,
+                        help="max active rollout sequences per rank (default: device batch size)")
     parser.add_argument("--rollout-prompts", "--examples-per-step", type=int, default=16,
                         help="total prompts per rollout round across ranks")
     parser.add_argument("--num-samples", type=int, default=8, help="completions per prompt")
@@ -123,6 +125,10 @@ def main():
     args = parser.parse_args()
     if args.num_samples < 2 or args.device_batch_size < 1 or args.rollout_prompts < 1:
         parser.error("num-samples must be >= 2 and batch sizes must be positive")
+    if args.rollout_batch_size is not None and args.rollout_batch_size < 1:
+        parser.error("rollout-batch-size must be positive")
+    if args.rollout_batch_size is None:
+        args.rollout_batch_size = args.device_batch_size
     if args.minibatch_size < 1 or args.update_epochs < 1 or not 0 < args.clip_eps < 1:
         parser.error("minibatch-size and update-epochs must be positive; clip-eps must be in (0, 1)")
     if args.temperature != 1.0 or args.top_k != 0:
@@ -172,12 +178,12 @@ def main():
 
     old_policy = copy.deepcopy(model).requires_grad_(False).eval()
     engine = None if use_transformers else LLMEngine(
-        old_policy, tokenizer, EngineConfig(max_num_seqs=args.device_batch_size),
+        old_policy, tokenizer, EngineConfig(max_num_seqs=args.rollout_batch_size),
     )
 
 
     rollout_backend = "transformers" if engine is None else "nanovllm"
-    print0(f"Rollout backend: {rollout_backend} | max sequences per generation call: {args.device_batch_size}")
+    print0(f"Rollout backend: {rollout_backend} | max active sequences per rank: {args.rollout_batch_size}")
 
     def render_prompt(conversation):
         if not use_transformers:
@@ -295,37 +301,51 @@ def main():
 
     @torch.no_grad()
     def collect_rollouts(round_idx, rank_indices, timings, *, log_sample=False):
+        examples = [(idx, train_task[idx]) for idx in itertools.islice(rank_indices, prompts_per_rank)]
+        prompts = [render_prompt(conversation) for _, conversation in examples]
+
+        with measure_phase(timings, "rollout"):
+            if engine is not None:
+                # The engine returns completions in prompt order, even when EOS
+                # frees slots and the scheduler admits later prompts.
+                outputs = generate_rollouts(
+                    prompts, num_samples=args.num_samples, max_tokens=args.max_new_tokens,
+                    logprobs=True, seed=hash((round_idx, ddp_rank)) & 0x7FFFFFFF,
+                )
+            else:
+                outputs = []
+                for (example_idx, _), prompt in zip(examples, prompts):
+                    for offset in range(0, args.num_samples, args.rollout_batch_size):
+                        outputs.extend(generate_rollouts(
+                            prompt,
+                            num_samples=min(args.rollout_batch_size, args.num_samples - offset),
+                            max_tokens=args.max_new_tokens, logprobs=True,
+                            seed=hash((round_idx, example_idx, offset)) & 0x7FFFFFFF,
+                        ))
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
         sequences, old_logprobs, rewards, advantages = [], [], [], []
         sample = None
-        for prompt_idx in range(prompts_per_rank):
-            example_idx = next(rank_indices)
-            conversation = train_task[example_idx]
-            prompt = render_prompt(conversation)
-            conversation = {**conversation, "completion_prompt": tokenizer.decode(prompt)}
-            group_rewards = []
-            for offset in range(0, args.num_samples, args.device_batch_size):
-                with measure_phase(timings, "rollout"):
-                    outputs = generate_rollouts(
-                        prompt, num_samples=min(args.device_batch_size, args.num_samples - offset),
-                        max_tokens=args.max_new_tokens, logprobs=True,
-                        seed=hash((round_idx, example_idx, offset)) & 0x7FFFFFFF,
-                    )
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
-                with measure_phase(timings, "reward"):
-                    completions = [tokenizer.decode(output.output_token_ids) for output in outputs]
-                    group_rewards.extend(train_task.reward(conversation, text) for text in completions)
-                if log_sample and prompt_idx == 0 and offset == 0:
-                    sample = {
-                        "example": example_idx,
-                        "prompt": conversation["completion_prompt"],
-                        "completion": completions[0],
-                        "expected_answer": conversation.get("answer", ""),
-                        "completion_tokens": len(outputs[0].output_token_ids),
-                    }
-                for output in outputs:
-                    sequences.append(torch.tensor(prompt + output.output_token_ids, device=device))
-                    old_logprobs.append(output.token_logprobs)
+        for prompt_idx, ((example_idx, conversation), prompt) in enumerate(zip(examples, prompts)):
+            start = prompt_idx * args.num_samples
+            group = outputs[start:start + args.num_samples]
+            with measure_phase(timings, "reward"):
+                prompt_text = tokenizer.decode(prompt)
+                reward_context = {**conversation, "completion_prompt": prompt_text}
+                completions = [tokenizer.decode(output.output_token_ids) for output in group]
+                group_rewards = [train_task.reward(reward_context, text) for text in completions]
+            if log_sample and prompt_idx == 0:
+                sample = {
+                    "example": example_idx,
+                    "prompt": prompt_text,
+                    "completion": completions[0],
+                    "expected_answer": conversation.get("answer", ""),
+                    "completion_tokens": len(group[0].output_token_ids),
+                }
+            for output in group:
+                sequences.append(torch.tensor(prompt + output.output_token_ids, device=device))
+                old_logprobs.append(output.token_logprobs)
 
             group_rewards = torch.tensor(group_rewards, dtype=torch.float32, device=device)
             rewards.append(group_rewards)
@@ -357,7 +377,13 @@ def main():
         for idx in range(ddp_rank, min(max_examples, len(task)), ddp_world_size):
             conversation = task[idx]
             prompt = render_prompt(conversation)
-            outputs = generate_rollouts(prompt, num_samples=num_samples, max_tokens=256, top_k=50)
+            outputs = []
+            chunk_size = args.rollout_batch_size if use_transformers else num_samples
+            for offset in range(0, num_samples, chunk_size):
+                outputs.extend(generate_rollouts(
+                    prompt, num_samples=min(chunk_size, num_samples - offset),
+                    max_tokens=256, top_k=50, seed=42 + offset,
+                ))
             yield [task.evaluate(conversation, tokenizer.decode(output.output_token_ids)) for output in outputs]
 
     # -----------------------------------------------------------------------------
@@ -452,36 +478,45 @@ def main():
                 optimizer.step()
                 model.zero_grad(set_to_none=True)
 
+        generation_stats = engine.last_generation_stats if engine is not None else {}
         stats = torch.stack((
             metrics[0] / args.update_epochs, metrics[1] / args.update_epochs,
             rewards.sum(), advantages.sum(), advantages.square().sum(),
             rewards.new_tensor(sum(lp.numel() for lp in old_logprobs)),
+            rewards.new_tensor(generation_stats.get("decode_steps", 0)),
+            rewards.new_tensor(generation_stats.get("decode_tokens", 0)),
         ))
         if ddp:
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-        loss, entropy, reward, advantage_mean, advantage_sq_mean, length = (
-            stats / (num_rollouts * ddp_world_size)
-        ).tolist()
+        loss_sum, entropy_sum, reward_sum, advantage_sum, advantage_sq_sum, rollout_tokens, decode_steps, decode_tokens = stats.tolist()
+        count = num_rollouts * ddp_world_size
+        loss = loss_sum / count
+        entropy = entropy_sum / count
+        reward = reward_sum / count
+        advantage_mean = advantage_sum / count
         logs = {
             "step": step,
             "loss": loss,
             "reward": reward,
             "advantage_mean": advantage_mean,
-            "advantage_std": max(0.0, advantage_sq_mean - advantage_mean ** 2) ** 0.5,
+            "advantage_std": max(0.0, advantage_sq_sum / count - advantage_mean ** 2) ** 0.5,
             "entropy": entropy,
-            "completion_length": length,
+            "completion_length": rollout_tokens / count,
             "lrm": lrm,
         }
         timing_logs = summarize_timings(timings)
-        rollout_tokens = int(stats[-1].item())
         rollout_seconds = timing_logs["timing/rollout_max_s"]
         rollout_tok_per_sec = rollout_tokens / rollout_seconds if rollout_seconds > 0 else 0.0
         logs.update(timing_logs)
         logs.update({
-            "rollout/generated_tokens": rollout_tokens,
+            "rollout/generated_tokens": int(rollout_tokens),
             "rollout/tokens_per_second": rollout_tok_per_sec,
         })
         timing_text = " | ".join(f"{name} time: {timing_logs[f'timing/{name}_max_s']:.3f}s" for name in timings)
+        if decode_steps:
+            average_decode_batch = decode_tokens / decode_steps
+            logs["rollout/average_decode_batch_size"] = average_decode_batch
+            timing_text += f" | avg decode batch: {average_decode_batch:.1f}"
         print0(f"Round {step}/{num_steps} | loss: {loss:.6f} | reward: {reward:.4f} | entropy: {entropy:.4f} | {rollout_tok_per_sec:.1f} rollout tok/s | {timing_text}")
         if sample is not None:
             for field in ("prompt", "completion", "expected_answer"):
