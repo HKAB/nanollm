@@ -485,6 +485,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
+        # Keep master weights in their stored dtype and convolve in activation dtype.
+        conv_weight = self.conv1d.weight.to(mixed_qkv.dtype)
+        conv_bias = self.conv1d.bias
+        if conv_bias is not None:
+            conv_bias = conv_bias.to(mixed_qkv.dtype)
+
         if cu_seqlens is not None:
             if not HAS_FLA_CONV:
                 raise RuntimeError(
@@ -495,8 +501,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             packed_qkv, final_conv_state = _fla_causal_conv1d(
                 x=packed_qkv,
-                weight=self.conv1d.weight.squeeze(1),
-                bias=self.conv1d.bias,
+                weight=conv_weight.squeeze(1),
+                bias=conv_bias,
                 activation=self.activation,
                 output_final_state=cache is not None,
                 cu_seqlens=cu_seqlens.to(torch.long),
@@ -508,7 +514,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 target = cache.linear_conv_states[self.layer_idx]
                 target.copy_(final_conv_state[:, :, -target.shape[-1]:])
         elif use_precomputed_states:
-            mixed_qkv = self.causal_conv1d_update(mixed_qkv, conv_state, self.conv1d.weight.squeeze(1), self.conv1d.bias, self.activation)
+            mixed_qkv = self.causal_conv1d_update(
+                mixed_qkv, conv_state, conv_weight.squeeze(1), conv_bias, self.activation,
+            )
         else:
             if cache is not None:
                 state_width = conv_state.shape[-1]
@@ -516,7 +524,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     mixed_qkv, (state_width - mixed_qkv.shape[-1], 0)
                 )
                 conv_state.copy_(new_conv_state)
-            mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+            mixed_qkv = F.conv1d(
+                mixed_qkv, conv_weight, conv_bias,
+                padding=self.conv1d.padding, groups=self.conv1d.groups,
+            )
+            mixed_qkv = F.silu(mixed_qkv[:, :, :seq_len])
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
@@ -688,7 +700,7 @@ class Qwen3_5Model(nn.Module):
                 ))
             else:
                 raise ValueError(f"unsupported inference layer type: {layer_type}")
-        return ModelCacheSpec(tuple(layers))
+        return ModelCacheSpec(tuple(layers), activation_dtype=COMPUTE_DTYPE)
 
     def estimate_flops(self, global_batch_size, seq_len):
         # Estimation from: https://docs.nvidia.com/nemo/automodel/0.4.0/_modules/nemo_automodel/components/utils/flops_utils.html#qwen3_5_flops

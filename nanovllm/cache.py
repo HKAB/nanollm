@@ -7,10 +7,6 @@ import torch
 from nanollm.inference import ModelCacheSpec
 
 
-def _model_dtype(model) -> torch.dtype:
-    return next(model.parameters()).dtype
-
-
 class PagedModelCache:
     """Paged attention storage plus slot-indexed recurrent model state.
 
@@ -42,8 +38,9 @@ class PagedModelCache:
             raise TypeError("get_inference_cache_spec() must return ModelCacheSpec")
 
         self.spec = spec
-        self.device = next(model.parameters()).device
-        self.dtype = _model_dtype(model)
+        parameter = next(model.parameters())
+        self.device = parameter.device
+        self.dtype = spec.activation_dtype or parameter.dtype
         self.block_size = block_size
         self.max_num_seqs = max_num_seqs
         self.n_layers = max((s.layer_idx for s in spec.layers), default=-1) + 1

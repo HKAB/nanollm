@@ -35,3 +35,4 @@ class ModelCacheSpec:
     """Complete heterogeneous inference-state description for a model."""
 
     layers: tuple[LayerCacheSpec, ...]
+    activation_dtype: torch.dtype | None = None

@@ -197,3 +197,32 @@ def test_recurrent_rows_are_gathered_and_committed_by_stable_slot():
     assert torch.all(cache.linear_conv_states[0][1] == 5)
     assert cache.cache_seqlens.tolist() == [12, 11]
     cache.end_forward()
+
+
+def test_qwen_hybrid_rollout_with_fp32_weights_and_bf16_activations(monkeypatch):
+    from nanollm.models import qwen
+
+    monkeypatch.setattr(qwen, "COMPUTE_DTYPE", torch.bfloat16)
+    config = qwen.Qwen3_5ModelConfig(
+        vocab_size=32, context_length=16, emb_dim=16, n_heads=2, n_layers=2,
+        hidden_dim=32, head_dim=8, qk_norm=True, n_kv_groups=1,
+        layer_types=["linear_attention", "full_attention"],
+        linear_num_key_heads=2, linear_num_value_heads=2,
+        linear_key_head_dim=8, linear_value_head_dim=8,
+    )
+    model = qwen.Qwen3_5Model(config).float().eval()
+    model.init_weights()
+    engine = LLMEngine(
+        model, TinyTokenizer(), EngineConfig(max_num_seqs=1, block_size=4, num_kv_blocks=2),
+    )
+    assert engine.cache.dtype == torch.bfloat16
+    outputs = engine.generate(
+        [1, 2], SamplingParams(max_tokens=3, temperature=0, ignore_eos=True),
+        OutputSpec(logprobs=True),
+    )
+    assert outputs[0].token_logprobs.shape == (3,)
+    assert torch.isfinite(outputs[0].token_logprobs).all()
+    model(torch.tensor([[1, 2, 3]])).float().square().mean().backward()
+    conv_grad = model.transformer.h[0].linear_attn.conv1d.weight.grad
+    assert conv_grad.dtype == torch.float32
+    assert torch.isfinite(conv_grad).all() and conv_grad.count_nonzero() > 0

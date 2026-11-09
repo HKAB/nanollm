@@ -903,7 +903,7 @@ class Ling3Model(nn.Module):
                     convolution_shapes=(conv_shape, conv_shape, conv_shape),
                     recurrent_dtype=torch.float32,
                 ))
-        return ModelCacheSpec(tuple(layers))
+        return ModelCacheSpec(tuple(layers), activation_dtype=COMPUTE_DTYPE)
 
     def num_scaling_params(self):
         wte = self.transformer.wte.weight.numel()
