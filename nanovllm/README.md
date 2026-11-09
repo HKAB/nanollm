@@ -2,7 +2,7 @@
 
 `nanovllm` is the offline inference runtime for models implemented in
 `nanollm.models`. It does not load or reimplement model architectures and it
-never falls back to `nanollm.engine.Engine`.
+provides the sole generation implementation.
 
 ```python
 from nanovllm import EngineConfig, LLMEngine, OutputSpec, SamplingParams
@@ -41,7 +41,7 @@ peak-memory profiling is implemented.
 
 ## Server validation checklist
 
-1. Compare greedy tokens and per-step logits with `nanollm.engine.Engine`.
+1. Compare greedy tokens and per-step logits with an uncached model-forward reference.
 2. Compare packed and one-request-at-a-time prefill results.
 3. Test ragged decode batches crossing page boundaries.
 4. Test Qwen3.5 GDN and convolution state across long decode runs.

@@ -1,7 +1,7 @@
 import torch
 
 from nanollm.checkpoint_manager import load_pretrained_hf
-from nanollm.engine import Engine
+from nanovllm import EngineConfig, LLMEngine, SamplingParams
 
 
 def test_load_pretrained_and_inference():
@@ -16,7 +16,7 @@ def test_load_pretrained_and_inference():
     assert tokenizer is not None
     
     # Create engine
-    engine = Engine(model, tokenizer)
+    engine = LLMEngine(model, tokenizer, EngineConfig(max_num_seqs=1))
     
     # Run inference
     prompt = "The capital of France is"
@@ -28,8 +28,8 @@ def test_load_pretrained_and_inference():
     else:
         tokens = tokenizer.encode(prompt)
         
-    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=10, temperature=0.0)
-    output_text = tokenizer.decode(sample[0])
+    outputs = engine.generate(tokens, sampling=SamplingParams(max_tokens=10, temperature=0.0))
+    output_text = tokenizer.decode(tokens + outputs[0].output_token_ids)
     
     print(f"Prompt: {prompt}")
     print(f"Output: {output_text}")

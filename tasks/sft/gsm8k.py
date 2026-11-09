@@ -41,6 +41,14 @@ def extract_answer(completion: str) -> str | None:
     return match.group(1).strip().replace(",", "")
 
 
+def think_reward(text: str) -> float:
+    """Score one nonempty reasoning block followed by a nonempty answer."""
+    return float(
+        text.count("<think>") == text.count("</think>") == 1
+        and re.fullmatch(r"\s*<think>\s*\S[\s\S]*?</think>\s*\S[\s\S]*", text) is not None
+    )
+
+
 class GSM8K:
     """GSM8K task compatible with the project's generative evaluation loops."""
 
@@ -55,6 +63,7 @@ class GSM8K:
         limit: int | None = None,
         shuffle: bool = True,
         seed: int = 42,
+        think_bonus: float = 0.1,
     ):
         if subset not in {"main", "socratic"}:
             raise ValueError("GSM8K subset must be 'main' or 'socratic'")
@@ -67,6 +76,7 @@ class GSM8K:
         if limit is not None:
             ds = ds.select(range(min(limit, len(ds))))
         self.ds = ds
+        self.think_bonus = think_bonus
 
     def __len__(self) -> int:
         return len(self.ds)
@@ -106,4 +116,11 @@ class GSM8K:
         return pred_num is not None and pred_num == ref_num
 
     def reward(self, conversation: dict[str, Any], assistant_response: str) -> float:
-        return float(self.evaluate(conversation, assistant_response))
+        reward = float(self.evaluate(conversation, assistant_response))
+        if self.think_bonus:
+            prompt = conversation.get("completion_prompt", "")
+            reasoning = assistant_response
+            if prompt.rstrip().endswith("<think>"):
+                reasoning = "<think>" + reasoning
+            reward += self.think_bonus * think_reward(reasoning)
+        return reward

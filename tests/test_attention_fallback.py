@@ -17,7 +17,7 @@ import pytest
 import torch
 
 import nanollm.flash_attention as fa_module
-from nanollm.engine import KVCache
+from nanollm.cache import KVCache
 from nanollm.flash_attention import HAS_FA3, flash_attn
 
 
