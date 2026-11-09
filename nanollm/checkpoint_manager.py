@@ -183,7 +183,7 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     if "lm_head.weight" not in state_dict:
         tie = hf_config.get("tie_word_embeddings", False) or hf_config.get("text_config", {}).get("tie_word_embeddings", False)
         if tie:
-            state_dict["lm_head.weight"] = state_dict["transformer.wte.weight"]
+            state_dict["lm_head.weight"] = state_dict["transformer.wte.weight"].clone()
 
     # Filter out keys not present in the model (e.g. visual encoder and MTP heads
     # from multimodal checkpoints that are not part of the text-only model).

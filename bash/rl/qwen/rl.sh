@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single-node GSM8K RL for Qwen3-0.6B-Base. Requires transformers >=4.57.
+# Single-node GSM8K RL for Qwen3.5-0.8B using nanoVLLM by default.
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.."
 export WANDB_MODE="${WANDB_MODE:-offline}"
@@ -7,10 +7,18 @@ export NANOLLM_CACHE_DIR="${NANOLLM_CACHE_DIR:-$PWD/.cache/nanollm}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$NANOLLM_CACHE_DIR/inductor}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+if [[ -n "${MODEL_TAG:-}${MODEL_SOURCE:-}${MODEL_STEP:-}" ]]; then
+    model_args=(--model-source "${MODEL_SOURCE:-sft}")
+    [[ -z "${MODEL_TAG:-}" ]] || model_args+=(--model-tag "$MODEL_TAG")
+    [[ -z "${MODEL_STEP:-}" ]] || model_args+=(--model-step "$MODEL_STEP")
+else
+    model_args=(--hf-model "${HF_MODEL:-Qwen/Qwen3.5-0.8B}" --hf-backend "${HF_BACKEND:-native}")
+fi
+
 exec "${TORCHRUN:-.venv/bin/torchrun}" --standalone --nproc_per_node="${NPROC_PER_NODE:-1}" \
-    -m scripts.chat_rl_grpo -- \
+    -m scripts.chat_rl_grpo \
     --device-type cuda \
-    --hf-model "${HF_MODEL:-Qwen/Qwen3.5-0.8B}" \
+    "${model_args[@]}" \
     --run "${RUN_NAME:-qwen3.5-0.8b-grpo}" \
     --rollout-prompts 16 \
     --num-samples 8 \

@@ -14,6 +14,7 @@ import itertools
 import math
 import os
 import re
+from pathlib import Path
 import sys
 from contextlib import contextmanager
 from time import perf_counter
@@ -61,7 +62,7 @@ def main():
 
     inductor_config.fx_graph_cache = True
 
-    from nanollm.checkpoint_manager import load_model, save_checkpoint
+    from nanollm.checkpoint_manager import load_model, load_pretrained_hf, save_checkpoint
     from nanollm.common import (
         DummyWandb,
         autodetect_device_type,
@@ -83,9 +84,13 @@ def main():
     # Runtime
     parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
     # Model loading
+    parser.add_argument("--model-source", choices=("base", "sft", "rl"),
+                        help="native checkpoint stage (default: sft)")
     parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
     parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
-    parser.add_argument("--hf-model", help="Hugging Face causal LM ID or local model directory")
+    parser.add_argument("--hf-model", help="Hugging Face repo ID or local safetensors directory")
+    parser.add_argument("--hf-backend", choices=("native", "transformers"), default="native",
+                        help="load a registered native architecture by default; transformers is for comparison")
     parser.add_argument("--hf-lr", type=float, default=1e-6, help="AdamW learning rate for --hf-model")
     # Training horizon
     parser.add_argument("--max-steps", type=int, default=None, help="cap rollout rounds for smoke tests")
@@ -124,8 +129,11 @@ def main():
         parser.error("matching rollout and training distributions requires --temperature=1 and --top-k=0")
     if args.max_steps is not None and args.max_steps < 1:
         parser.error("max-steps must be positive")
-    if args.hf_model and (args.model_tag is not None or args.model_step is not None):
-        parser.error("--hf-model cannot be combined with --model-tag or --model-step")
+    if args.hf_model and any(value is not None for value in (args.model_source, args.model_tag, args.model_step)):
+        parser.error("--hf-model cannot be combined with --model-source, --model-tag, or --model-step")
+    if not args.hf_model and args.hf_backend != "native":
+        parser.error("--hf-backend transformers requires --hf-model")
+    use_transformers = bool(args.hf_model and args.hf_backend == "transformers")
     if args.sample_every < 0 or args.sample_max_chars < 1:
         parser.error("sample-every must be nonnegative and sample-max-chars must be positive")
     user_config = vars(args).copy()
@@ -141,22 +149,38 @@ def main():
     wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanollm-rl", name=args.run, config=user_config)
 
     # Init model and tokenizer
-    if args.hf_model:
+    if use_transformers:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(args.hf_model)
         model = AutoModelForCausalLM.from_pretrained(args.hf_model, dtype=torch.float32).to(device).eval()
+    elif args.hf_model:
+        model_dir = Path(args.hf_model).expanduser()
+        if not model_dir.is_dir():
+            from huggingface_hub import snapshot_download
+
+            model_dir = snapshot_download(
+                args.hf_model, allow_patterns=["config.json", "tokenizer.json", "*.safetensors"],
+            )
+        model, tokenizer, meta = load_pretrained_hf(model_dir, device, phase="eval")
+        # Match the Transformers path's FP32 trainable weights and AdamW.
+        model.float()
     else:
-        model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+        model, tokenizer, meta = load_model(
+            args.model_source or "sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step,
+        )
 
     old_policy = copy.deepcopy(model).requires_grad_(False).eval()
-    engine = None if args.hf_model else LLMEngine(
+    engine = None if use_transformers else LLMEngine(
         old_policy, tokenizer, EngineConfig(max_num_seqs=args.device_batch_size),
     )
 
 
+    rollout_backend = "transformers" if engine is None else "nanovllm"
+    print0(f"Rollout backend: {rollout_backend} | max sequences per generation call: {args.device_batch_size}")
+
     def render_prompt(conversation):
-        if not args.hf_model:
+        if not use_transformers:
             return tokenizer.render_for_completion(conversation, enable_thinking=None)
         if tokenizer.chat_template:
             text = tokenizer.apply_chat_template(
@@ -171,7 +195,7 @@ def main():
 
 
     def policy_logits(inputs):
-        if not args.hf_model:
+        if not use_transformers:
             return model(inputs)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
             return model(inputs, use_cache=False).logits
@@ -184,7 +208,7 @@ def main():
 
     def generate_rollouts(prompt, *, num_samples, max_tokens, temperature=1.0, top_k=0,
                             seed=42, logprobs=False):
-        if args.hf_model:
+        if use_transformers:
             ids = torch.tensor([prompt], device=device)
             eos_id = tokenizer.eos_token_id
             # Use an explicit config so checkpoint defaults cannot change the sampling distribution.
@@ -449,9 +473,16 @@ def main():
             "lrm": lrm,
         }
         timing_logs = summarize_timings(timings)
+        rollout_tokens = int(stats[-1].item())
+        rollout_seconds = timing_logs["timing/rollout_max_s"]
+        rollout_tok_per_sec = rollout_tokens / rollout_seconds if rollout_seconds > 0 else 0.0
         logs.update(timing_logs)
+        logs.update({
+            "rollout/generated_tokens": rollout_tokens,
+            "rollout/tokens_per_second": rollout_tok_per_sec,
+        })
         timing_text = " | ".join(f"{name} time: {timing_logs[f'timing/{name}_max_s']:.3f}s" for name in timings)
-        print0(f"Round {step}/{num_steps} | loss: {loss:.6f} | reward: {reward:.4f} | entropy: {entropy:.4f} | {timing_text}")
+        print0(f"Round {step}/{num_steps} | loss: {loss:.6f} | reward: {reward:.4f} | entropy: {entropy:.4f} | {rollout_tok_per_sec:.1f} rollout tok/s | {timing_text}")
         if sample is not None:
             for field in ("prompt", "completion", "expected_answer"):
                 value = str(sample[field])
@@ -477,7 +508,7 @@ def main():
         if master_process and args.save_every > 0 and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
             base_dir = get_base_dir()
             checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", f"step_{step:05d}")
-            if args.hf_model:
+            if use_transformers:
                 model.save_pretrained(checkpoint_dir)
                 tokenizer.save_pretrained(checkpoint_dir)
             else:

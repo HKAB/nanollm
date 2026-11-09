@@ -28,6 +28,7 @@ def map_hf_config(hf_config, mapper_type):
     config = hf_config.get("text_config", hf_config)
 
     if mapper_type == "qwen3_5":
+        rope = config.get("rope_parameters") or {}
         return {
             "vocab_size": config.get("vocab_size", 152064),
             "context_length": config.get("max_position_embeddings", 4096),
@@ -38,8 +39,8 @@ def map_hf_config(hf_config, mapper_type):
             "head_dim": config.get("head_dim", 256),
             "qk_norm": config.get("qk_norm", True),
             "n_kv_groups": config.get("num_key_value_heads", 2),
-            "rope_base": config.get("rope_theta", 1000000.0) or config.get("rope_parameters", {}).get("rope_theta", 1000000.0),
-            "partial_rotary_factor": config.get("partial_rotary_factor", 1.0) or config.get("rope_parameters", {}).get("partial_rotary_factor", 1.0),
+            "rope_base": config.get("rope_theta") or rope.get("rope_theta", 1000000.0),
+            "partial_rotary_factor": config.get("partial_rotary_factor") or rope.get("partial_rotary_factor", 1.0),
             "rms_norm_eps": config.get("rms_norm_eps", 1e-6),
             "layer_types": config.get("layer_types", ["full_attention"] * config.get("num_hidden_layers", 24)),
             "linear_num_value_heads": config.get("linear_num_value_heads", 16),

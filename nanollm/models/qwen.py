@@ -149,13 +149,13 @@ def compute_rope_params(head_dim, theta_base=10_000.0, context_length=4096, part
     assert head_dim % 2 == 0, "head_dim must be even for rotary embeddings"
     rotary_dim = int(head_dim * partial_rotary_factor)
     rotary_dim = max(2, rotary_dim - (rotary_dim % 2))
-    inv_freq = 1.0 / (theta_base ** (torch.arange(0, rotary_dim, 2, dtype=dtype)[: rotary_dim // 2] / rotary_dim))
-    positions = torch.arange(context_length, dtype=dtype)
+    inv_freq = 1.0 / (theta_base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32)[: rotary_dim // 2] / rotary_dim))
+    positions = torch.arange(context_length, dtype=torch.float32)
     angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
     angles = torch.cat([angles, angles], dim=-1)
     cos = torch.cos(angles)
     sin = torch.sin(angles)
-    return cos, sin
+    return cos.to(dtype), sin.to(dtype)
 
 def apply_rope_bhsd(x, cos, sin):
     # x shape: (B, num_heads, seq_len, head_dim)
@@ -618,6 +618,20 @@ class Qwen3_5Model(nn.Module):
 
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
+
+    @torch.no_grad()
+    def prepare_for_checkpoint_load(self):
+        """Restore nonpersistent rotary buffers after loading from meta."""
+        with torch.device(self.cos.device):
+            cos, sin = compute_rope_params(
+                head_dim=self.config.head_dim,
+                theta_base=self.config.rope_base,
+                context_length=self.config.context_length,
+                partial_rotary_factor=self.config.partial_rotary_factor,
+                dtype=self.cos.dtype,
+            )
+        self.cos.copy_(cos)
+        self.sin.copy_(sin)
 
     def enable_gradient_checkpointing(self):
         self.use_gradient_checkpointing = True
