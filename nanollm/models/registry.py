@@ -1,5 +1,7 @@
 import re
 
+from nanollm.tokenizers.gemma4_tokenizer import Gemma4Tokenizer
+
 from nanollm.tokenizers.qwen_tokenizer import QwenTokenizer
 from nanollm.tokenizers.ling_tokenizer import LingTokenizer
 
@@ -21,6 +23,12 @@ MODEL_REGISTRY = {
         "config_mapper": "ling3",
         "state_dict_mapper": "ling3",
     },
+}
+
+QWEN_MA_ARCHITECTURE = "QwenMaForCausalLM"
+MODEL_REGISTRY[QWEN_MA_ARCHITECTURE] = {
+    **MODEL_REGISTRY["Qwen3_5ForConditionalGeneration"],
+    "tokenizer_class": Gemma4Tokenizer,
 }
 
 def map_hf_config(hf_config, mapper_type):

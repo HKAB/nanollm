@@ -8,10 +8,12 @@ import os
 import re
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from nanollm.common import get_base_dir, setup_default_logging
 from nanollm.models import get_model_entry, map_hf_config, map_hf_state_dict
+from nanollm.models.registry import QWEN_MA_ARCHITECTURE
 from nanollm.tokenizer import get_tokenizer
 
 # Set up logging
@@ -154,7 +156,34 @@ def find_last_step(checkpoint_dir):
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanollm's directory structure
 
-def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
+def _load_gemma_embedding(checkpoint_dir, device):
+    keys = ("model.language_model.embed_tokens.weight", "model.embed_tokens.weight")
+    for path in glob.glob(os.path.join(checkpoint_dir, "*.safetensors")):
+        with safe_open(path, framework="pt", device=str(device)) as shard:
+            for key in keys:
+                if key in shard.keys():
+                    return shard.get_tensor(key)
+    raise ValueError(f"Gemma 4 text embedding tensor was not found in {checkpoint_dir}")
+
+
+@torch.no_grad()
+def _remap_qwen_head(weight, source_vocab, target_vocab, vocab_size):
+    matches = [
+        (target_id, source_vocab[token])
+        for token, target_id in target_vocab.items()
+        if token in source_vocab and source_vocab[token] < weight.size(0)
+    ]
+    target_ids, source_ids = zip(*matches) if matches else ((), ())
+    target_ids = torch.tensor(target_ids, device=weight.device, dtype=torch.long)
+    source_ids = torch.tensor(source_ids, device=weight.device, dtype=torch.long)
+    resized = weight.new_empty(vocab_size, weight.size(1)).normal_(std=0.02)
+    resized.index_copy_(0, target_ids, weight.index_select(0, source_ids))
+    return resized
+
+
+def load_pretrained_hf(pretrained_dir, device, phase="eval", *, gemma_model_path=None, **kwargs):
+    if kwargs.get("gemma_tokenizer_path") is not None:
+        raise ValueError("Qwen-ma now requires gemma_model_path with Gemma weights and tokenizer")
     config_path = os.path.join(pretrained_dir, "config.json")
     with open(config_path, "r", encoding="utf-8") as f:
         hf_config = json.load(f)
@@ -162,6 +191,24 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     architectures = hf_config.get("architectures", [])
     entry = get_model_entry(architectures)
     model_config_kwargs = map_hf_config(hf_config, entry["config_mapper"])
+    if gemma_model_path is not None:
+        if entry["config_mapper"] != "qwen3_5":
+            raise ValueError("Qwen-ma requires a Qwen3.5 checkpoint")
+        source_vocab = get_tokenizer(pretrained_dir, architectures).tokenizer.get_vocab()
+        architectures = [QWEN_MA_ARCHITECTURE]
+        entry = get_model_entry(architectures)
+        gemma_embedding = _load_gemma_embedding(gemma_model_path, device)
+        tokenizer = get_tokenizer(gemma_model_path, architectures)
+        if tokenizer.get_bos_token_id() is None or None in tokenizer.get_eos_token_ids():
+            raise ValueError("Qwen-ma requires a Gemma 4 tokenizer with <bos> and <eos>")
+        target_vocab = tokenizer.tokenizer.get_vocab()
+        vocab_size = max(target_vocab.values()) + 1
+        if vocab_size > gemma_embedding.size(0):
+            raise ValueError("Gemma tokenizer IDs exceed the Gemma embedding table")
+        model_config_kwargs.update(
+            architectures=architectures, vocab_size=vocab_size,
+            gemma_embedding_dim=gemma_embedding.size(1),
+        )
     model_config_kwargs = _set_runtime_moe_backend(
         model_config_kwargs, architectures, device, kwargs.get("moe_backend")
     )
@@ -183,7 +230,18 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     if "lm_head.weight" not in state_dict:
         tie = hf_config.get("tie_word_embeddings", False) or hf_config.get("text_config", {}).get("tie_word_embeddings", False)
         if tie:
-            state_dict["lm_head.weight"] = state_dict["transformer.wte.weight"].clone()
+            embedding = state_dict["transformer.wte.weight"]
+            state_dict["lm_head.weight"] = embedding if gemma_model_path is not None else embedding.clone()
+
+    if gemma_model_path is not None:
+        state_dict["transformer.wte.weight"] = gemma_embedding[:vocab_size]
+        state_dict["lm_head.weight"] = _remap_qwen_head(
+            state_dict["lm_head.weight"], source_vocab, target_vocab, vocab_size
+        )
+        projection = model.transformer.wte.projection
+        if isinstance(projection, torch.nn.Linear):
+            torch.nn.init.xavier_uniform_(projection.weight)
+            state_dict["transformer.wte.projection.weight"] = projection.weight.detach()
 
     # Filter out keys not present in the model (e.g. visual encoder and MTP heads
     # from multimodal checkpoints that are not part of the text-only model).
@@ -201,7 +259,8 @@ def load_pretrained_hf(pretrained_dir, device, phase="eval", **kwargs):
     else:
         model.train()
         
-    tokenizer = get_tokenizer(pretrained_dir, architectures)
+    if gemma_model_path is None:
+        tokenizer = get_tokenizer(pretrained_dir, architectures)
     return model, tokenizer, {"model_config": model_config_kwargs}
 
 def load_model(source, *args, **kwargs):

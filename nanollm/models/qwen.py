@@ -54,6 +54,7 @@ class Qwen3_5ModelConfig:
     linear_conv_kernel_dim: int = 4
     hidden_act: str = "silu"
     architectures: list = None
+    gemma_embedding_dim: int | None = None
 
 
 class Qwen3_5Cache(KVCache):
@@ -105,6 +106,18 @@ class Linear(nn.Linear):
     def forward(self, x):
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(dtype=x.dtype), bias)
+
+class GemmaInputEmbedding(nn.Embedding):
+    def __init__(self, vocab_size, embedding_dim, backbone_dim):
+        super().__init__(vocab_size, embedding_dim)
+        self.projection = (
+            Linear(embedding_dim, backbone_dim, bias=False)
+            if embedding_dim != backbone_dim else nn.Identity()
+        )
+
+    def forward(self, ids):
+        return self.projection(super().forward(ids) * (self.embedding_dim ** 0.5))
+
 
 class FeedForward(nn.Module):
     def __init__(self, cfg):
@@ -609,8 +622,13 @@ class Qwen3_5Model(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        embedding = (
+            nn.Embedding(config.vocab_size, config.emb_dim)
+            if config.gemma_embedding_dim is None
+            else GemmaInputEmbedding(config.vocab_size, config.gemma_embedding_dim, config.emb_dim)
+        )
         self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.emb_dim),
+            "wte": embedding,
             "h": nn.ModuleList([TransformerBlock(config, config.layer_types[i], i) for i in range(config.n_layers)]),
         })
         self.final_norm = RMSNorm(config.emb_dim, eps=config.rms_norm_eps)
@@ -786,7 +804,7 @@ class Qwen3_5Model(nn.Module):
 
         
     def num_scaling_params(self):
-        wte = self.transformer.wte.weight.numel()
+        wte = sum(p.numel() for p in self.transformer.wte.parameters())
         lm_head = self.lm_head.weight.numel() if hasattr(self, 'lm_head') else wte
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.final_norm.weight.numel()
