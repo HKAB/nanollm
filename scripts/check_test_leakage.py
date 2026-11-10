@@ -1,8 +1,8 @@
 """Scan training JSONL for normalized CORE test questions."""
 
 import argparse
-from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import glob
 import hashlib
 from itertools import islice
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from time import monotonic, process_time
 import unicodedata
 
 import orjson
@@ -19,7 +20,7 @@ from scripts.leakage_index import file_identity, jsonl_rows
 from scripts.pretokenize import sharegpt_to_messages
 
 WORDS = re.compile(r"\w+")
-RANGE_BYTES = 64 * 1024**2
+RANGE_BYTES = 16 * 1024**2
 
 
 def normalize(text):
@@ -27,27 +28,44 @@ def normalize(text):
 
 
 def build_matcher(grouped):
-    items = []
-    frequencies = Counter()
+    import ahocorasick
+
+    by_query = defaultdict(list)
     for task, rows in grouped.items():
         for index, row in enumerate(rows):
             query = normalize(row["query"])
-            words = set(WORDS.findall(query))
+            words = WORDS.findall(query)
             if not words:
                 raise ValueError(f"CORE query has no searchable words: {task}/{index}")
-            frequencies.update(words)
-            choices = {normalize(choice) for choice in row["choices"]} - {""}
-            items.append((task, index, query, words, choices))
-    matcher = defaultdict(list)
-    for task, index, query, words, choices in items:
-        anchor = min(words, key=lambda word: (frequencies[word], -len(word), word))
-        question = re.compile(r"(?<!\w)" + re.escape(query) + r"(?!\w)")
-        evidence = [
-            re.compile(r"(?<!\w)" + re.escape(choice) + r"(?!\w)")
-            for choice in sorted(choices)
-        ] if len(WORDS.findall(query)) < 8 else []
-        matcher[anchor].append((task, index, question, evidence))
-    return dict(matcher)
+            choices = []
+            if len(words) < 8:
+                choices = [
+                    re.compile(r"(?<!\w)" + re.escape(choice) + r"(?!\w)")
+                    for choice in sorted({normalize(choice) for choice in row["choices"]} - {""})
+                ]
+            by_query[query].append((task, index, choices))
+
+    matcher = ahocorasick.Automaton()
+    for query, items in by_query.items():
+        matcher.add_word(query, (len(query), items))
+    matcher.make_automaton()
+    return matcher
+
+
+def find_hits(fields, matcher):
+    hits = set()
+    for field in fields:
+        for end, (length, items) in matcher.iter(field):
+            before = end - length
+            after = end + 1
+            if (before >= 0 and WORDS.fullmatch(field[before])
+                    or after < len(field) and WORDS.fullmatch(field[after])):
+                continue
+            for task, index, choices in items:
+                if not choices or sum(any(choice.search(text) for text in fields)
+                                      for choice in choices) >= 2:
+                    hits.add((task, index))
+    return hits
 
 
 def init_worker(matcher):
@@ -56,6 +74,7 @@ def init_worker(matcher):
 
 
 def scan_range(filename, start, end, mode):
+    started = process_time()
     matches = []
     invalid = 0
     for offset, line in jsonl_rows(filename, start, end):
@@ -71,22 +90,14 @@ def scan_range(filename, start, end, mode):
             continue
 
         fields = [normalize(field) for field in fields if isinstance(field, str)]
-        hits = set()
-        for field in fields:
-            for word in set(WORDS.findall(field)):
-                for task, index, question, choices in MATCHER.get(word, ()):
-                    if question.search(field) and (
-                        not choices or sum(any(choice.search(text) for text in fields)
-                                           for choice in choices) >= 2
-                    ):
-                        hits.add((task, index))
+        hits = find_hits(fields, MATCHER)
         if hits:
             matches.append({
                 "offset": offset,
                 "items": [{"task": task, "index": index} for task, index in sorted(hits)],
                 "reason": "normalized_query",
             })
-    return matches, invalid
+    return matches, invalid, process_time() - started
 
 
 def main():
@@ -116,6 +127,13 @@ def main():
     if args.revision:
         os.environ["NANOLLM_CORE_DATASET_REVISION"] = args.revision
 
+    try:
+        import ahocorasick
+    except ModuleNotFoundError:
+        parser.error("Install pyahocorasick in the scanner environment (python -m pip install pyahocorasick)")
+    if not ahocorasick.unicode:
+        parser.error("pyahocorasick must be built with Unicode support")
+
     print(f"Loading CORE test data from {args.dataset}", flush=True)
     from tasks.pretrain.core import load_core_data
 
@@ -129,30 +147,41 @@ def main():
     }
     matched = invalid = 0
     total = sum(entry["source"]["size"] for entry in manifest["files"].values())
+    ranges = (
+        (path, start, min(start + RANGE_BYTES, size))
+        for path, entry in manifest["files"].items()
+        for size in [entry["source"]["size"]]
+        for start in range(0, size, RANGE_BYTES)
+    )
+    started = monotonic()
+    cpu_seconds = 0.0
     with (
         ProcessPoolExecutor(max_workers=args.cpu_count, initializer=init_worker,
                             initargs=(matcher,)) as pool,
         tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024, desc="Scanning JSONL") as progress,
     ):
-        for path, entry in manifest["files"].items():
-            size = entry["source"]["size"]
-            range_size = min(RANGE_BYTES, max(1, (size + args.cpu_count - 1) // args.cpu_count))
-            starts = iter(range(0, size, range_size))
-            while batch := list(islice(starts, 4 * args.cpu_count)):
-                futures = {
-                    pool.submit(scan_range, path, start, min(start + range_size, size), args.mode):
-                    min(range_size, size - start) for start in batch
-                }
-                for future in as_completed(futures):
-                    hits, errors = future.result()
-                    entry["matches"].extend(hits)
-                    matched += len(hits)
-                    invalid += errors
-                    progress.set_postfix(matched=matched, invalid=invalid, refresh=False)
-                    progress.update(futures[future])
-            entry["matches"].sort(key=lambda match: match["offset"])
+        pending = {}
+        while True:
+            for path, start, end in islice(ranges, 2 * args.cpu_count - len(pending)):
+                future = pool.submit(scan_range, path, start, end, args.mode)
+                pending[future] = (path, end - start)
+            if not pending:
+                break
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                path, size = pending.pop(future)
+                hits, errors, elapsed_cpu = future.result()
+                manifest["files"][path]["matches"].extend(hits)
+                matched += len(hits)
+                invalid += errors
+                cpu_seconds += elapsed_cpu
+                progress.set_postfix(matched=matched, invalid=invalid,
+                                     cpu_cores=f"{cpu_seconds / (monotonic() - started):.1f}",
+                                     refresh=False)
+                progress.update(size)
 
     for path, entry in manifest["files"].items():
+        entry["matches"].sort(key=lambda match: match["offset"])
         if file_identity(path) != entry["source"]:
             raise RuntimeError(f"Input changed during scan: {path}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
