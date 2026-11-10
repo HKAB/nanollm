@@ -157,6 +157,13 @@ def find_last_step(checkpoint_dir):
 # convenience functions that take into account nanollm's directory structure
 
 def _load_gemma_embedding(checkpoint_dir, device):
+    config_path = os.path.join(checkpoint_dir, "config.json")
+    with open(config_path, encoding="utf-8") as f:
+        config = json.load(f)
+    if config.get("model_type") not in {"gemma4", "gemma4_text"}:
+        raise ValueError(
+            f"--gemma-model-path must point to a Gemma 4 checkpoint, got {checkpoint_dir}"
+        )
     keys = ("model.language_model.embed_tokens.weight", "model.embed_tokens.weight")
     for path in glob.glob(os.path.join(checkpoint_dir, "*.safetensors")):
         with safe_open(path, framework="pt", device=str(device)) as shard:
