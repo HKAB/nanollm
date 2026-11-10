@@ -2,6 +2,7 @@ import argparse
 import bisect
 import concurrent.futures
 import glob
+import hashlib
 import logging
 import os
 import orjson
@@ -14,6 +15,8 @@ import pyarrow.parquet as pq
 from nanollm.tokenizer import get_tokenizer
 from tqdm import tqdm
 from transformers import AutoTokenizer
+
+from scripts.leakage_index import jsonl_rows, read_index
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +222,7 @@ def parse_args():
         "--architectures", nargs="+", default=["Qwen3_5ForConditionalGeneration"],
         help="Model architectures for the tokenizer wrapper (e.g. Qwen3_5ForConditionalGeneration).",
     )
+    parser.add_argument("--leakage-index", help="Skip rows flagged by the CORE leakage scan.")
     return parser.parse_args()
 
 
@@ -231,15 +235,22 @@ def init_db(db_path):
     conn.close()
 
 
-def register_chunks(db_path, filename, file_size, cpu_count):
+def register_chunks(db_path, filename, file_size, cpu_count, indexed=False):
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     chunk_size = file_size // cpu_count
 
+    prefix = os.path.basename(filename)
+    if indexed:
+        prefix += "_" + hashlib.sha256(os.fsencode(filename)).hexdigest()[:16]
+        if c.execute("SELECT 1 FROM chunks WHERE filename = ? LIMIT 1", (filename,)).fetchone():
+            conn.close()
+            return
+
     for i in range(cpu_count):
         start = i * chunk_size
         end = file_size if i == cpu_count - 1 else (i + 1) * chunk_size
-        chunk_id = f"{os.path.basename(filename)}_part_{i}"
+        chunk_id = f"{prefix}_part_{i}"
         c.execute("INSERT OR IGNORE INTO chunks (chunk_id, filename, start_byte, end_byte, status) VALUES (?, ?, ?, ?, 'PENDING')",
                   (chunk_id, filename, start, end))
     conn.commit()
@@ -263,8 +274,34 @@ def update_chunk_status(db_path, chunk_id, status):
     conn.close()
 
 
+def bind_leakage_index(db_path, output_dir, digest):
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE IF NOT EXISTS leakage_config (digest TEXT NOT NULL)")
+        saved = conn.execute("SELECT digest FROM leakage_config").fetchone()
+        if saved is None:
+            existing_chunks = conn.execute("SELECT 1 FROM chunks LIMIT 1").fetchone()
+            if digest and (existing_chunks or glob.glob(os.path.join(output_dir, "*.parquet"))):
+                raise ValueError("Applying a leakage index requires a fresh output directory.")
+            conn.execute("INSERT INTO leakage_config VALUES (?)", (digest,))
+        elif saved[0] != digest:
+            raise ValueError("Changing the leakage index requires a fresh output directory.")
+
+
+def chunk_offsets(offsets, filename, start, end):
+    values = offsets.get(filename, ())
+    return values[bisect.bisect_left(values, start):bisect.bisect_left(values, end)]
+
+
+def eligible_rows(filename, start, end, offsets):
+    skip = set(offsets)
+    for offset, line in jsonl_rows(filename, start, end):
+        if offset not in skip:
+            yield line
+
+
 def process_chunk(chunk_id, filename, start_byte, end_byte,
-                  tokenizer_id, output_dir, chunk_size, write_threshold):
+                  tokenizer_id, output_dir, chunk_size, write_threshold, offsets=()):
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, use_fast=True)
         eos_id = tokenizer.eos_token_id
@@ -273,37 +310,29 @@ def process_chunk(chunk_id, filename, start_byte, end_byte,
         global_blocks = []
         file_counter = 0
 
-        with open(filename, "rb") as f:
-            f.seek(start_byte)
-            if start_byte != 0:
-                f.readline()
-
-            while f.tell() < end_byte:
-                line = f.readline()
-                if not line: break
-
-                try:
-                    doc = orjson.loads(line)
-                    text = doc.get('text', '')
-                    if not text:
-                        continue
-
-                    tokens = tokenizer(text, add_special_tokens=False).input_ids + [eos_id]
-                    local_buffer.extend(tokens)
-
-                    while len(local_buffer) >= chunk_size:
-                        global_blocks.append(local_buffer[:chunk_size])
-                        local_buffer = local_buffer[chunk_size:]
-
-                    if len(global_blocks) >= write_threshold:
-                        out_path = os.path.join(output_dir, f"{chunk_id}_{file_counter}.parquet")
-                        table = pa.Table.from_arrays([pa.array(global_blocks)], names=["input_ids"])
-                        pq.write_table(table, out_path)
-                        global_blocks = []
-                        file_counter += 1
-
-                except Exception:
+        for line in eligible_rows(filename, start_byte, end_byte, offsets):
+            try:
+                doc = orjson.loads(line)
+                text = doc.get('text', '')
+                if not text:
                     continue
+
+                tokens = tokenizer(text, add_special_tokens=False).input_ids + [eos_id]
+                local_buffer.extend(tokens)
+
+                while len(local_buffer) >= chunk_size:
+                    global_blocks.append(local_buffer[:chunk_size])
+                    local_buffer = local_buffer[chunk_size:]
+
+                if len(global_blocks) >= write_threshold:
+                    out_path = os.path.join(output_dir, f"{chunk_id}_{file_counter}.parquet")
+                    table = pa.Table.from_arrays([pa.array(global_blocks)], names=["input_ids"])
+                    pq.write_table(table, out_path)
+                    global_blocks = []
+                    file_counter += 1
+
+            except Exception:
+                continue
 
         if global_blocks:
             out_path = os.path.join(output_dir, f"{chunk_id}_{file_counter}.parquet")
@@ -318,7 +347,7 @@ def process_chunk(chunk_id, filename, start_byte, end_byte,
 
 def process_chunk_sft(chunk_id, filename, start_byte, end_byte,
                       tokenizer_id, output_dir, seq_len, pack_chunk_size,
-                      long_doc, write_threshold, architectures):
+                      long_doc, write_threshold, architectures, offsets=()):
     """SFT worker: read a jsonl byte-range of ShareGPT records, render + smart-chunk
     them, and neat-pack (best-fit) into seq_len-length blocks written as parquet.
 
@@ -356,38 +385,30 @@ def process_chunk_sft(chunk_id, filename, start_byte, end_byte,
             if len(block_buffer) >= write_threshold:
                 flush_blocks()
 
-        with open(filename, "rb") as f:
-            f.seek(start_byte)
-            if start_byte != 0:
-                f.readline()
-
-            while f.tell() < end_byte:
-                line = f.readline()
-                if not line:
-                    break
-                try:
-                    doc = orjson.loads(line)
-                    messages = sharegpt_to_messages(doc)
-                    if not messages:
-                        continue
-                    n_docs += 1
-
-                    ids, mask, boundaries = tokenizer.render_conversation(
-                        {"messages": messages}, max_tokens=render_max, return_boundaries=True,
-                    )
-                    if not ids or sum(mask) == 0:
-                        n_empty += 1  # nothing to supervise
-                        continue
-
-                    items, dropped = smart_chunk_conversation(ids, mask, boundaries, seq_len, long_doc)
-                    n_dropped += dropped
-                    item_buffer.extend(items)
-
-                    if len(item_buffer) >= pack_chunk_size:
-                        pack_buffer()
-
-                except Exception:
+        for line in eligible_rows(filename, start_byte, end_byte, offsets):
+            try:
+                doc = orjson.loads(line)
+                messages = sharegpt_to_messages(doc)
+                if not messages:
                     continue
+                n_docs += 1
+
+                ids, mask, boundaries = tokenizer.render_conversation(
+                    {"messages": messages}, max_tokens=render_max, return_boundaries=True,
+                )
+                if not ids or sum(mask) == 0:
+                    n_empty += 1  # nothing to supervise
+                    continue
+
+                items, dropped = smart_chunk_conversation(ids, mask, boundaries, seq_len, long_doc)
+                n_dropped += dropped
+                item_buffer.extend(items)
+
+                if len(item_buffer) >= pack_chunk_size:
+                    pack_buffer()
+
+            except Exception:
+                continue
 
         pack_buffer()   # pack the trailing partial buffer
         flush_blocks()  # flush any remaining blocks
@@ -399,19 +420,20 @@ def process_chunk_sft(chunk_id, filename, start_byte, end_byte,
         return chunk_id, "ERROR", str(e)
 
 
-def run_sft(args, db_path, all_filename):
+def run_sft(args, db_path, all_filename, offsets=None):
     """SFT pretokenization: render ShareGPT, neat-pack, write 3-column parquet shards."""
     logger.info(
         f"SFT mode | seq_len={args.seq_len} (train max-seq-len must be {args.seq_len - 1}) | "
         f"pack_chunk_size={args.pack_chunk_size} | long_doc={args.long_doc}"
     )
 
+    offsets = offsets or {}
     totals = {"docs": 0, "blocks": 0, "dropped": 0, "empty": 0}
     for filename in all_filename:
         file_size = os.path.getsize(filename)
         logger.info(f"Processing {filename} ({file_size / (1024**3):.2f} GB)")
 
-        register_chunks(db_path, filename, file_size, args.cpu_count)
+        register_chunks(db_path, filename, file_size, args.cpu_count, indexed=bool(offsets))
         pending_chunks = get_pending_chunks(db_path, filename)
 
         if not pending_chunks:
@@ -425,7 +447,8 @@ def run_sft(args, db_path, all_filename):
                 executor.submit(
                     process_chunk_sft, c_id, filename, start, end,
                     args.tokenizer, args.output_dir, args.seq_len, args.pack_chunk_size,
-                    args.long_doc, args.write_threshold, args.architectures
+                    args.long_doc, args.write_threshold, args.architectures,
+                    chunk_offsets(offsets, filename, start, end),
                 ): c_id
                 for c_id, start, end in pending_chunks
             }
@@ -492,8 +515,15 @@ def main():
 
     logger.info(f"Found {len(all_filename)} total files to process.")
 
+    offsets, digest = {}, ""
+    if args.leakage_index:
+        all_filename = sorted({os.path.realpath(filename) for filename in all_filename})
+        offsets, digest = read_index(args.leakage_index, args.mode, all_filename)
+        logger.info("Loaded leakage index with %s flagged rows", sum(map(len, offsets.values())))
+    bind_leakage_index(db_path, args.output_dir, digest)
+
     if args.mode == "sft":
-        run_sft(args, db_path, all_filename)
+        run_sft(args, db_path, all_filename, offsets)
         return
 
     global_leftover_buffer = []
@@ -502,7 +532,7 @@ def main():
         file_size = os.path.getsize(filename)
         logger.info(f"Processing {filename} ({file_size / (1024**3):.2f} GB)")
 
-        register_chunks(db_path, filename, file_size, args.cpu_count)
+        register_chunks(db_path, filename, file_size, args.cpu_count, indexed=bool(offsets))
         pending_chunks = get_pending_chunks(db_path, filename)
 
         if not pending_chunks:
@@ -516,6 +546,7 @@ def main():
                 executor.submit(
                     process_chunk, c_id, filename, start, end,
                     args.tokenizer, args.output_dir, args.chunk_size, args.write_threshold,
+                    chunk_offsets(offsets, filename, start, end),
                 ): c_id
                 for c_id, start, end in pending_chunks
             }

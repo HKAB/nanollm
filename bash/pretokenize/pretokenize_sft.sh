@@ -14,6 +14,7 @@ TOKENIZER=Qwen/Qwen3.5-0.8B-Base
 HF_HOME=/mnt/data/users/truongnp5/cache/huggingface
 SEQ_LEN=4097   # train --max-seq-len must be 2048
 
+# Optional arguments, e.g. --leakage-index path/to/index.json
 python -m scripts.pretokenize \
     --mode            sft \
     --input-dir       "$INPUT_DIR" \
@@ -25,4 +26,4 @@ python -m scripts.pretokenize \
     --long-doc        smart_chunk \
     --cpu-count       16 \
     --write-threshold 20000 \
-    --ignore
+    --ignore "$@"

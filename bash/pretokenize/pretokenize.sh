@@ -9,6 +9,7 @@ OUTPUT_DIR=/mnt/data/users/truongnp5/final_clean_data/vi_en_parquet_v1_pretokeni
 TOKENIZER=Qwen/Qwen3.5-0.8B-Base
 HF_HOME=/mnt/data/users/truongnp5/cache/huggingface
 
+# Optional arguments, e.g. --leakage-index path/to/index.json
 python -m scripts.pretokenize \
     --input-dir       "$INPUT_DIR" \
     --output-dir      "$OUTPUT_DIR" \
@@ -16,4 +17,4 @@ python -m scripts.pretokenize \
     --hf-home         "$HF_HOME" \
     --chunk-size      8192 \
     --cpu-count       16 \
-    --write-threshold 20000
+    --write-threshold 20000 "$@"
