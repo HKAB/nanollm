@@ -132,8 +132,8 @@ parser.add_argument(
     help="path or HF repo id of pretrained model/tokenizer",
 )
 parser.add_argument(
-    "--gemma-model-path",
-    help="Local Gemma 4 checkpoint directory with weights and tokenizer. Enables Qwen-ma.",
+    "--gemma-tokenizer-path", "--gemma-model-path",
+    help="Gemma 4 tokenizer directory or HF repo ID. Enables Qwen-ma.",
 )
 parser.add_argument("--dataset-root", type=str, required=True, help="root of merged flat shards (output of pretokenize_and_merge.py)")
 args = parser.parse_args()
@@ -205,7 +205,7 @@ model, tokenizer, meta_data_loaded = load_pretrained_hf(
     device,
     phase="train",
     moe_backend=args.moe_backend,
-    gemma_model_path=args.gemma_model_path,
+    gemma_tokenizer_path=args.gemma_tokenizer_path,
 )
 model_config_kwargs = meta_data_loaded["model_config"]
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")

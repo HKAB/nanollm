@@ -2,12 +2,13 @@
 set -euo pipefail
 
 : "${QWEN_MODEL_PATH:?Set QWEN_MODEL_PATH to the local Qwen3.5 base snapshot}"
-: "${GEMMA_MODEL_PATH:?Set GEMMA_MODEL_PATH to the local Gemma 4 snapshot}"
+GEMMA_TOKENIZER_PATH="${GEMMA_TOKENIZER_PATH:-${GEMMA_MODEL_PATH:-}}"
+: "${GEMMA_TOKENIZER_PATH:?Set GEMMA_TOKENIZER_PATH to the local Gemma 4 tokenizer directory}"
 : "${DATASET_ROOT:?Set DATASET_ROOT to the Gemma-tokenized parquet dataset}"
 
 # Resolve relative paths before switching to the repository root.
 QWEN_MODEL_PATH="$(cd -- "$QWEN_MODEL_PATH" && pwd -P)"
-GEMMA_MODEL_PATH="$(cd -- "$GEMMA_MODEL_PATH" && pwd -P)"
+GEMMA_TOKENIZER_PATH="$(cd -- "$GEMMA_TOKENIZER_PATH" && pwd -P)"
 DATASET_ROOT="$(cd -- "$DATASET_ROOT" && pwd -P)"
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.."
 
@@ -20,7 +21,7 @@ exec torchrun --standalone --nproc-per-node=8 -m scripts.base_train \
     --wandb-project nanollm \
     --wandb-tags "qwen-ma,2B,pretrain" \
     --pretrained-model-path "$QWEN_MODEL_PATH" \
-    --gemma-model-path "$GEMMA_MODEL_PATH" \
+    --gemma-tokenizer-path "$GEMMA_TOKENIZER_PATH" \
     --dataset-root "$DATASET_ROOT" \
     --max-seq-len 4096 \
     --num-iterations 200 \
