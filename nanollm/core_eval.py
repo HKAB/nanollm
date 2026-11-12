@@ -213,7 +213,9 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
 
     # Stack up all the sequences into a batch
-    pad_token_id = tokenizer.token_to_id("<|endoftext|>")
+    # Right padding cannot affect earlier causal predictions, and the scoring
+    # slices below exclude padded positions.
+    pad_token_id = tokenizer.get_pad_token_id()
     input_ids = stack_sequences(tokens, pad_token_id)
     input_ids = input_ids.to(device)
 

@@ -60,6 +60,34 @@ class Tokenizer:
     def get_bos_token_id(self):
         return self.tokenizer.token_to_id("<|endoftext|>")
 
+    def get_pad_token_id(self):
+        """Return a padding ID without adding tokens to the vocabulary.
+
+        Prefer configured/known padding tokens, then EOS, BOS, and finally an
+        existing vocabulary ID. Callers must exclude padding from scoring and
+        mask it from attention when it could affect real tokens.
+        Subclasses can override this for model-specific token conventions.
+        """
+        padding = self.tokenizer.padding
+        if padding is not None and padding.get("pad_id") is not None:
+            return padding["pad_id"]
+        for token in ("<|pad|>", "<pad>", "[PAD]", "<|endoftext|>"):
+            token_id = self.token_to_id(token)
+            if token_id is not None:
+                return token_id
+        eos_ids = self.get_eos_token_ids() - {None}
+        if eos_ids:
+            return min(eos_ids)
+        bos_id = self.get_bos_token_id()
+        if bos_id is not None:
+            return bos_id
+        if self.id_to_token(0) is not None:
+            return 0
+        vocab = self.tokenizer.get_vocab()
+        if not vocab:
+            raise ValueError("Cannot choose a padding token from an empty vocabulary")
+        return min(vocab.values())
+
     def encode(self, text, *args, **kwargs):
         if isinstance(text, str):
             return self._encode_one(text, *args, **kwargs)
