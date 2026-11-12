@@ -568,20 +568,32 @@ while True:
             "Cacbon có 2 hóa trị là",
             "Vừa gà vừa chó bó lại cho tròn 36 con 100 chân chẵn. Hỏi có bao nhiêu con gà, bao nhiêu con chó?"
         ]
-        engine = LLMEngine(
-            orig_model, tokenizer, EngineConfig(max_num_seqs=1)
-        )  # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt)
-            with disable_fp8(orig_model):
-                sample = engine.generate(
-                    tokens, SamplingParams(max_tokens=16, temperature=0)
-                )[0]
-            print0(tokenizer.decode(
-                sample.prompt_token_ids + sample.output_token_ids
-            ))
-        engine.release_cache()
-        model.train()
+        tokenized_prompts = [tokenizer(prompt) for prompt in prompts]
+        sample_max_tokens = 16
+        sample_block_size = 256
+        # Prompts run sequentially: reserve only the longest sequence's cache,
+        # rather than budgeting against the entire GPU alongside training state.
+        sample_num_blocks = (
+            max(map(len, tokenized_prompts)) + sample_max_tokens + sample_block_size - 1
+        ) // sample_block_size
+        try:
+            with LLMEngine(
+                orig_model, tokenizer, EngineConfig(
+                    max_num_seqs=1,
+                    block_size=sample_block_size,
+                    num_kv_blocks=sample_num_blocks,
+                ),
+            ) as engine:  # use orig_model to avoid recompilation
+                for tokens in tokenized_prompts:
+                    with disable_fp8(orig_model):
+                        sample = engine.generate(
+                            tokens, SamplingParams(max_tokens=sample_max_tokens, temperature=0)
+                        )[0]
+                    print0(tokenizer.decode(
+                        sample.prompt_token_ids + sample.output_token_ids
+                    ))
+        finally:
+            model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):

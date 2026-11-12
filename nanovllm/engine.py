@@ -71,6 +71,12 @@ class LLMEngine:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release_cache()
+
     def _eos_ids(self) -> set[int]:
         if hasattr(self.tokenizer, "get_eos_token_ids"):
             return set(self.tokenizer.get_eos_token_ids())

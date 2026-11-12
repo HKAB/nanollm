@@ -7,6 +7,15 @@ import torch
 from nanollm.inference import ModelCacheSpec
 
 
+def _available_kv_cache_bytes(device, gpu_memory_utilization):
+    # mem_get_info includes unused memory reserved by PyTorch's allocator.
+    # Return it to CUDA before measuring, especially after training/evaluation.
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info(device)
+    return max(0, int(total * gpu_memory_utilization) - (total - free))
+
+
 class PagedModelCache:
     """Paged attention storage plus slot-indexed recurrent model state.
 
@@ -90,11 +99,16 @@ class PagedModelCache:
             elif self.device.type != "cuda":
                 num_kv_blocks = max_num_seqs
             else:
-                free, total = torch.cuda.mem_get_info(self.device)
-                budget = max(0, int(total * gpu_memory_utilization) - (total - free))
+                budget = _available_kv_cache_bytes(self.device, gpu_memory_utilization)
                 num_kv_blocks = budget // bytes_per_block
         if num_kv_blocks <= 0:
-            raise RuntimeError("no memory remains for paged KV blocks")
+            raise RuntimeError(
+                "no memory remains for paged KV blocks under the configured budget "
+                f"(one block requires {bytes_per_block} bytes). "
+                "Release unused tensors or reduce cache concurrency. For inference "
+                "alongside training, set num_kv_blocks or kv_cache_memory_gib "
+                "to the workload's required cache size."
+            )
         self.num_kv_blocks = num_kv_blocks
 
         self._k_cache: dict[int, torch.Tensor] = {}

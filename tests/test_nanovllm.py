@@ -6,11 +6,28 @@ import pytest
 
 from nanollm.inference import LayerCacheSpec, ModelCacheSpec
 from nanovllm import EngineConfig, LLMEngine, OutputSpec, SamplingParams
-from nanovllm.cache import PagedModelCache
+from nanovllm.cache import PagedModelCache, _available_kv_cache_bytes
 
 
 class TinyTokenizer:
     eos_token_id = 7
+
+
+def test_auto_cache_budget_reclaims_allocator_memory_before_measuring(monkeypatch):
+    from contextlib import nullcontext
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("reclaim"))
+
+    def memory_info(device):
+        assert calls == ["reclaim"]
+        return 400, 1000
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", memory_info)
+    assert _available_kv_cache_bytes(torch.device("cuda:0"), 0.9) == 300
+    calls.clear()
+    assert _available_kv_cache_bytes(torch.device("cuda:0"), 0.5) == 0
 
 
 class TinyModel(nn.Module):
@@ -113,6 +130,28 @@ def test_hybrid_prefix_cache_cannot_be_enabled_incompletely():
             TinyTokenizer(),
             EngineConfig(num_kv_blocks=4, enable_prefix_caching=True),
         )
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_engine_context_releases_cache_after_generation(monkeypatch, fail):
+    engine = LLMEngine(
+        TinyModel(), TinyTokenizer(),
+        EngineConfig(max_num_seqs=1, block_size=2, num_kv_blocks=2),
+    )
+    if fail:
+        def broken_prefill(batch):
+            raise RuntimeError("forward failed")
+        monkeypatch.setattr(engine.runner, "prefill", broken_prefill)
+        with pytest.raises(RuntimeError, match="forward failed"):
+            with engine:
+                engine.generate([1], SamplingParams(max_tokens=2))
+    else:
+        with engine:
+            engine.generate([1], SamplingParams(max_tokens=2))
+    assert engine.cache is None
+    assert engine.runner is None
+    assert engine.scheduler is None
+    assert engine.block_manager is None
 
 
 def test_kv_cache_size_options_are_mutually_exclusive():
