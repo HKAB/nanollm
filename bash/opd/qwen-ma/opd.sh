@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One OPD update on Vietnamese V-IFEval prompts with a Qwen-MA student.
+# Qwen-MA OPD experiment on Vietnamese V-IFEval prompts.
 set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.."
@@ -34,6 +34,7 @@ else
 fi
 
 nproc="${NPROC_PER_NODE:-1}"
+run_name="${RUN_NAME:-qwen-ma-opd-$(date -u +%Y%m%d-%H%M%S)}"
 launch=("$python_bin")
 if (( nproc > 1 )); then
     launch+=(-m torch.distributed.run --standalone --nproc-per-node "$nproc")
@@ -43,8 +44,10 @@ exec "${launch[@]}" -m scripts.chat_opd \
     "${student_args[@]}" "${teacher_args[@]}" \
     --dataset hkab/vi-ifeval --dataset-split test \
     --prompt-format raw \
-    --rollout-prompts "$nproc" \
-    --num-samples 1 --rollout-batch-size 1 --device-batch-size 1 \
-    --max-new-tokens 16 --max-steps 1 \
-    --save-tag "${SAVE_TAG:-qwen-ma-opd}" \
+    --run "$run_name" \
+    --rollout-prompts "${ROLLOUT_PROMPTS:-$((4 * nproc))}" \
+    --num-samples "${NUM_SAMPLES:-1}" \
+    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-4}" --device-batch-size "${DEVICE_BATCH_SIZE:-1}" \
+    --max-new-tokens "${MAX_NEW_TOKENS:-128}" --max-steps "${MAX_STEPS:-100}" \
+    --save-every "${SAVE_EVERY:-50}" --save-tag "${SAVE_TAG:-$run_name}" \
     "$@"

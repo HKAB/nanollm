@@ -3,7 +3,11 @@
 import argparse
 import json
 import math
+import subprocess
+from collections import deque
+from datetime import timedelta
 from pathlib import Path
+from time import perf_counter
 
 import torch
 import torch.distributed as dist
@@ -17,6 +21,7 @@ from nanollm.common import (
     compute_init,
     get_base_dir,
     get_dist_info,
+    get_peak_flops,
     print0,
 )
 from nanovllm import EngineConfig, LLMEngine, OutputSpec, SamplingParams
@@ -113,6 +118,28 @@ def importance_sampling(current_logprobs, sampled_logprobs, advantages):
     return -ratio * advantages.detach(), ratio
 
 
+def gpu_utilization(device):
+    try:
+        return torch.cuda.utilization(device)
+    except Exception:
+        # The driver or optional management library may not expose utilization.
+        pass
+
+    # Match by UUID because CUDA's device index can differ from nvidia-smi's.
+    uuid = getattr(torch.cuda.get_device_properties(device), "uuid", None)
+    if uuid is not None and not torch.version.hip:
+        gpu_id = "GPU-" + str(uuid).removeprefix("GPU-")
+        try:
+            output = subprocess.check_output(
+                ["nvidia-smi", "-i", gpu_id, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL, timeout=1, text=True,
+            )
+            return int(output.strip())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    return None
+
+
 def train(args, ddp, rank, world_size, device):
     from datasets import load_dataset
 
@@ -166,9 +193,14 @@ def train(args, ddp, rank, world_size, device):
         run_config = {key: value for key, value in vars(args).items() if not key.endswith("model_kwargs")}
         wandb_run = wandb.init(project="nanollm-opd", name=args.run, config=run_config)
 
-    print0(f"{num_steps} OPD steps | {args.rollout_prompts * args.num_samples} completions per step")
+    print0(f"{num_steps} OPD steps | {args.rollout_prompts * args.num_samples} completions per step", flush=True)
     engine = LLMEngine(student, tokenizer, engine_config)
+    log_cuda = rank == 0 and device.type == "cuda"
+    gpu_peak_flops = get_peak_flops(torch.cuda.get_device_name(device)) if log_cuda else math.inf
+    estimate_flops = getattr(student, "estimate_flops", None) if math.isfinite(gpu_peak_flops) else None
+    recent_step_times = deque(maxlen=20)
     for step in range(1, num_steps + 1):
+        step_started = perf_counter()
         start = ((step - 1) % rounds_per_epoch) * args.rollout_prompts + rank * prompts_per_rank
         prompt_texts = dataset[start:start + prompts_per_rank]["prompt"]
         prompts = [render_prompt(tokenizer, prompt, args.prompt_format, max_seq_len) for prompt in prompt_texts]
@@ -188,8 +220,11 @@ def train(args, ddp, rank, world_size, device):
         if ddp:
             dist.all_reduce(token_count)
         totals = torch.zeros(3, device=device)
+        student_flops = 0
         for offset in range(0, len(outputs), args.device_batch_size):
             inputs, targets, sampled = collate_rollouts(outputs[offset:offset + args.device_batch_size], pad_id, device)
+            if estimate_flops is not None:
+                student_flops += estimate_flops(*inputs.shape)
             mask = targets >= 0
             sampled = sampled[mask]
             with torch.no_grad():
@@ -217,12 +252,38 @@ def train(args, ddp, rank, world_size, device):
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        loss, reverse_kl, ratio = (totals / token_count).tolist()
-        logs = dict(step=step, loss=loss, teacher_kl=reverse_kl, importance_ratio=ratio,
-                    completion_tokens=token_count.item(), grad_norm=grad_norm.item())
-        print0(f"Step {step}/{num_steps} | loss {loss:.6f} | sampled reverse KL {reverse_kl:.6f} "
-               f"| mean ratio {ratio:.6f} | grad norm {logs['grad_norm']:.6f} | tokens {logs['completion_tokens']}")
-        wandb_run.log(logs)
+        if rank == 0:
+            loss, reverse_kl, ratio = (totals / token_count).tolist()
+            logs = dict(step=step, loss=loss, teacher_kl=reverse_kl, importance_ratio=ratio,
+                        completion_tokens=token_count.item(), grad_norm=grad_norm.item())
+            step_seconds = perf_counter() - step_started
+            recent_step_times.append(step_seconds)
+            eta_seconds = (num_steps - step) * (sum(recent_step_times) / len(recent_step_times))
+            eta = timedelta(seconds=math.ceil(eta_seconds))
+            tok_per_sec = logs["completion_tokens"] / step_seconds
+            logs.update({"timing/step_s": step_seconds, "timing/eta_s": eta_seconds,
+                         "train/completion_tok_per_sec": tok_per_sec})
+            gpu_text = ""
+            if log_cuda:
+                current_gib = torch.cuda.memory_allocated(device) / 1024**3
+                peak_gib = torch.cuda.max_memory_allocated(device) / 1024**3
+                utilization = gpu_utilization(device)
+                logs.update({"system/gpu_memory_allocated_gib": current_gib,
+                             "system/gpu_memory_peak_gib": peak_gib})
+                util_text = "n/a" if utilization is None else f"{utilization}%"
+                if utilization is not None:
+                    logs["system/gpu_utilization_pct"] = utilization
+                gpu_text = f" | GPU memory {current_gib:.2f}/{peak_gib:.2f} GiB | GPU util {util_text}"
+                if estimate_flops is not None:
+                    # Student forward/backward FLOPs as a share of end-to-end step time.
+                    mfu = 100 * student_flops / (step_seconds * gpu_peak_flops)
+                    logs["train/student_mfu"] = mfu
+                    gpu_text += f" | student MFU {mfu:.1f}%"
+            print0(f"Step {step}/{num_steps} | loss {loss:.6f} | sampled reverse KL {reverse_kl:.6f} "
+                   f"| mean ratio {ratio:.6f} | grad norm {logs['grad_norm']:.6f} "
+                   f"| tokens {logs['completion_tokens']} | {step_seconds:.2f}s | {tok_per_sec:.1f} tok/s"
+                   f"{gpu_text} | ETA {eta}", flush=True)
+            wandb_run.log(logs)
         if rank == 0 and args.save_every and (step % args.save_every == 0 or step == num_steps):
             checkpoint_dir = Path(get_base_dir()) / "chatopd_checkpoints" / args.save_tag
             save_checkpoint(checkpoint_dir, step, student.state_dict(), None, meta, tokenizer=tokenizer)
