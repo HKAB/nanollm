@@ -33,7 +33,12 @@ import wandb
 inductor_config.fx_graph_cache = True
 import torch.distributed as dist
 
-from nanollm.checkpoint_manager import load_model, save_checkpoint
+from nanollm.checkpoint_manager import (
+    add_checkpoint_retention_arg,
+    load_model,
+    prune_checkpoints,
+    save_checkpoint,
+)
 from nanollm.common import (
     DummyWandb,
     autodetect_device_type,
@@ -75,6 +80,7 @@ parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
 parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
+add_checkpoint_retention_arg(parser)
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -374,6 +380,7 @@ for step in range(num_steps):
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+        prune_checkpoints(os.path.dirname(checkpoint_dir), args.max_checkpoints, step_directories=True)
 
 # Log to report
 from nanollm.report import get_report

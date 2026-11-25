@@ -13,7 +13,13 @@ from time import perf_counter
 import torch
 import torch.distributed as dist
 
-from nanollm.checkpoint_manager import load_model, load_pretrained_hf, save_checkpoint
+from nanollm.checkpoint_manager import (
+    add_checkpoint_retention_arg,
+    load_model,
+    load_pretrained_hf,
+    prune_checkpoints,
+    save_checkpoint,
+)
 from nanollm.common import (
     COMPUTE_DTYPE,
     DummyWandb,
@@ -330,6 +336,7 @@ def train(args, ddp, rank, world_size, device):
         if rank == 0 and args.save_every and (step % args.save_every == 0 or step == num_steps):
             checkpoint_dir = Path(get_base_dir()) / "chatopd_checkpoints" / args.save_tag
             save_checkpoint(checkpoint_dir, step, student.state_dict(), None, meta, tokenizer=tokenizer)
+            prune_checkpoints(checkpoint_dir, args.max_checkpoints)
 
     wandb_run.finish()
 
@@ -358,6 +365,7 @@ def main():
     parser.add_argument("--run", default="dummy")
     parser.add_argument("--save-tag", default="opd")
     parser.add_argument("--save-every", type=int, default=0, help="Checkpoint interval, 0 disables saving")
+    add_checkpoint_retention_arg(parser)
     args = parser.parse_args()
 
     for prefix in ("", "teacher_"):

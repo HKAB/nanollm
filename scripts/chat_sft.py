@@ -34,7 +34,13 @@ inductor_config.fx_graph_cache = True
 
 import torch.distributed as dist
 
-from nanollm.checkpoint_manager import load_model, load_optimizer_state, save_checkpoint
+from nanollm.checkpoint_manager import (
+    add_checkpoint_retention_arg,
+    load_model,
+    load_optimizer_state,
+    prune_checkpoints,
+    save_checkpoint,
+)
 from nanollm.common import (
     COMPUTE_DTYPE,
     COMPUTE_DTYPE_REASON,
@@ -119,6 +125,7 @@ parser.add_argument(
     help="save checkpoints every N steps (-1 = only at end)",
 )
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile")
+add_checkpoint_retention_arg(parser)
 args = parser.parse_args()
 assert args.num_iterations > 0, "--num-iterations must be > 0"
 assert args.chatcore_batch_size > 0, "--chatcore-batch-size must be > 0"
@@ -485,6 +492,13 @@ while True:
             tokenizer=tokenizer,
             rank=ddp_rank,
         )
+        # Wait for all optimizer shards before removing older checkpoints.
+        if ddp:
+            dist.barrier()
+        if master_process:
+            prune_checkpoints(os.path.dirname(checkpoint_dir), args.max_checkpoints, step_directories=True)
+        if ddp:
+            dist.barrier()
 
     if last_step:
         break

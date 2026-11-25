@@ -62,7 +62,13 @@ def main():
 
     inductor_config.fx_graph_cache = True
 
-    from nanollm.checkpoint_manager import load_model, load_pretrained_hf, save_checkpoint
+    from nanollm.checkpoint_manager import (
+        add_checkpoint_retention_arg,
+        load_model,
+        load_pretrained_hf,
+        prune_checkpoints,
+        save_checkpoint,
+    )
     from nanollm.common import (
         DummyWandb,
         autodetect_device_type,
@@ -122,6 +128,7 @@ def main():
     parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
     parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
     parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
+    add_checkpoint_retention_arg(parser)
     args = parser.parse_args()
     if args.num_samples < 2 or args.device_batch_size < 1 or args.rollout_prompts < 1:
         parser.error("num-samples must be >= 2 and batch sizes must be positive")
@@ -552,6 +559,7 @@ def main():
                     {"model_config": meta.get("model_config", {})}, tokenizer=tokenizer,
                 )
             print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+            prune_checkpoints(os.path.dirname(checkpoint_dir), args.max_checkpoints, step_directories=True)
 
     # Log to report
     from nanollm.report import get_report

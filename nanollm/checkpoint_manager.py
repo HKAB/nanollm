@@ -1,12 +1,15 @@
 """
 Utilities for saving and loading model/optim/state checkpoints.
 """
+import argparse
 import glob
 import json
 import logging
 import os
 import re
+import shutil
 from collections import defaultdict
+from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
@@ -19,6 +22,53 @@ from nanollm.tokenizer import get_tokenizer
 # Set up logging
 setup_default_logging()
 logger = logging.getLogger(__name__)
+DEFAULT_MAX_CHECKPOINTS = 5
+
+
+def _positive_checkpoint_limit(value):
+    limit = int(value)
+    if limit < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return limit
+
+
+def add_checkpoint_retention_arg(parser):
+    parser.add_argument(
+        "--max-checkpoints", type=_positive_checkpoint_limit, default=DEFAULT_MAX_CHECKPOINTS,
+        help="maximum checkpoints to keep (default: %(default)s)",
+    )
+
+
+def prune_checkpoints(checkpoint_dir, max_checkpoints, *, step_directories=False):
+    """Remove the lowest-numbered checkpoints after a successful save."""
+    if max_checkpoints < 1:
+        raise ValueError("max_checkpoints must be at least 1")
+
+    checkpoints = []
+    for path in Path(checkpoint_dir).iterdir():
+        if step_directories:
+            match = re.fullmatch(r"step_([0-9]{5,})", path.name)
+            if match and path.is_dir() and not path.is_symlink():
+                step = int(match[1])
+                if (path / f"meta_{step:06d}.json").is_file() or (path / "config.json").is_file():
+                    checkpoints.append((step, path))
+        else:
+            match = re.fullmatch(r"model_([0-9]{6,})\.pt", path.name)
+            if match and path.is_file():
+                checkpoints.append((int(match[1]), path))
+
+    for step, path in sorted(checkpoints)[:-max_checkpoints]:
+        if step_directories:
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+            path.with_name(f"meta_{step:06d}.json").unlink(missing_ok=True)
+            for shard in path.parent.glob(f"optim_{step:06d}_rank*.pt"):
+                if re.fullmatch(rf"optim_{step:06d}_rank[0-9]+\.pt", shard.name):
+                    shard.unlink(missing_ok=True)
+        logger.info("Pruned checkpoint at step %d: %s", step, path)
+
+
 def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)

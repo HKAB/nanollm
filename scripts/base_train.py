@@ -40,8 +40,10 @@ if hasattr(dynamo_config, "cache_size_limit"):
     dynamo_config.cache_size_limit = max(dynamo_config.cache_size_limit, 32)
 
 from nanollm.checkpoint_manager import (
+    add_checkpoint_retention_arg,
     load_checkpoint,
     load_pretrained_hf,
+    prune_checkpoints,
     save_checkpoint,
 )
 from nanollm.common import (
@@ -136,6 +138,7 @@ parser.add_argument(
     help="Gemma 4 tokenizer directory or HF repo ID. Enables Qwen-Ma or LingMa.",
 )
 parser.add_argument("--dataset-root", type=str, required=True, help="root of merged flat shards (output of pretokenize_and_merge.py)")
+add_checkpoint_retention_arg(parser)
 args = parser.parse_args()
 if args.gradient_checkpointing_interval < 1:
     parser.error("--gradient-checkpointing-interval must be at least 1")
@@ -625,6 +628,13 @@ while True:
             tokenizer=tokenizer,
             rank=ddp_rank,
         )
+        # Wait for all optimizer shards before removing older checkpoints.
+        if ddp:
+            dist.barrier()
+        if master_process:
+            prune_checkpoints(checkpoint_dir, args.max_checkpoints)
+        if ddp:
+            dist.barrier()
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
