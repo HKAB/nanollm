@@ -989,10 +989,11 @@ class Qwen3_5Model(nn.Module):
             # The fused loss calls F.linear directly, whereas our ordinary
             # Linear wrapper converts its weight to the activation dtype.
             head_weight = self.lm_head.weight.to(dtype=hidden_2d.dtype)
-            return self.liger_linear_cross_entropy[loss_reduction](
+            return self._fused_linear_cross_entropy(
                 head_weight,
                 hidden_2d,
                 targets.reshape(-1),
+                loss_reduction,
             )
 
         hidden_states = x
@@ -1004,6 +1005,11 @@ class Qwen3_5Model(nn.Module):
         if return_hidden_states:
             return logits, hidden_states
         return logits
+
+    @torch.compiler.disable
+    def _fused_linear_cross_entropy(self, head_weight, hidden_states, targets, reduction):
+        # Liger reads the valid-token count with Tensor.item() inside its fused op.
+        return self.liger_linear_cross_entropy[reduction](head_weight, hidden_states, targets)
 
     def project_logits(self, hidden_states):
         """Apply the model-specific output transformation."""
