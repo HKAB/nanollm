@@ -31,6 +31,12 @@ MODEL_REGISTRY[QWEN_MA_ARCHITECTURE] = {
     "tokenizer_class": Gemma4Tokenizer,
 }
 
+LING_MA_ARCHITECTURE = "LingMaForCausalLM"
+MODEL_REGISTRY[LING_MA_ARCHITECTURE] = {
+    **MODEL_REGISTRY["BailingMoeV3ForCausalLM"],
+    "tokenizer_class": Gemma4Tokenizer,
+}
+
 def map_hf_config(hf_config, mapper_type):
     # Some checkpoints nest the language model config under 'text_config'
     config = hf_config.get("text_config", hf_config)

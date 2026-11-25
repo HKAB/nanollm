@@ -110,7 +110,7 @@ parser.add_argument("--gradient-checkpointing", action="store_true", help="recom
 parser.add_argument("--gradient-checkpointing-interval", type=int, default=1, help="Ling only: checkpoint every Nth MoE block; 1 checkpoints every block (default)")
 parser.add_argument("--moe-bias-update-rate", type=float, default=1e-3, help="loss-free MoE expert-bias update rate (Ling default: 1e-3; 0 disables)")
 parser.add_argument("--moe-backend", type=str, default="auto", choices=["auto", "torch", "transformer_engine"], help="Ling routed-expert backend (auto uses Transformer Engine on CUDA when installed)")
-parser.add_argument("--linear-cross-entropy-backend", type=str, default="auto", choices=["auto", "torch", "liger"], help="Ling training loss backend (auto uses Liger on CUDA when installed, otherwise PyTorch)")
+parser.add_argument("--linear-cross-entropy-backend", type=str, default="auto", choices=["auto", "torch", "liger"], help="Qwen and Ling training loss backend (auto uses Liger on CUDA when installed, otherwise PyTorch)")
 parser.add_argument("--timing-every", type=int, default=0, help="print lightweight CUDA phase/component timings every N training steps (0 disables)")
 parser.add_argument("--profile-module", action="append", default=[], metavar="LABEL=GLOB", help="aggregate first-microbatch CUDA forward time by module name glob or type:ClassGlob; repeatable")
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging or unsupported hardware)")
@@ -133,7 +133,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--gemma-tokenizer-path", "--gemma-model-path",
-    help="Gemma 4 tokenizer directory or HF repo ID. Enables Qwen-ma.",
+    help="Gemma 4 tokenizer directory or HF repo ID. Enables Qwen-Ma or LingMa.",
 )
 parser.add_argument("--dataset-root", type=str, required=True, help="root of merged flat shards (output of pretokenize_and_merge.py)")
 args = parser.parse_args()
@@ -280,8 +280,13 @@ if args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
+        uses_fused_loss = getattr(model, "linear_cross_entropy_backend", None) == "liger"
+
         # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
         def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+            # The fused loss projects with the head weight directly.
+            if uses_fused_loss and fqn == "lm_head":
+                return False
             if not isinstance(mod, nn.Linear):
                 return False
             if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:

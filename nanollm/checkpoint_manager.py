@@ -13,7 +13,7 @@ from safetensors.torch import load_file
 
 from nanollm.common import get_base_dir, setup_default_logging
 from nanollm.models import get_model_entry, map_hf_config, map_hf_state_dict
-from nanollm.models.registry import QWEN_MA_ARCHITECTURE
+from nanollm.models.registry import LING_MA_ARCHITECTURE, QWEN_MA_ARCHITECTURE
 from nanollm.tokenizer import get_tokenizer
 
 # Set up logging
@@ -26,7 +26,7 @@ def log0(message):
 
 def _set_runtime_moe_backend(config_kwargs, architectures, device, requested=None):
     """Resolve the optional Ling MoE backend without affecting other models."""
-    if "BailingMoeV3ForCausalLM" not in architectures:
+    if get_model_entry(architectures)["config_mapper"] != "ling3":
         return config_kwargs
     config_kwargs = dict(config_kwargs)
     backend = requested if requested is not None else config_kwargs.get("moe_backend", "auto")
@@ -156,7 +156,7 @@ def find_last_step(checkpoint_dir):
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanollm's directory structure
 
-def _qwen_token_groups(source, target, source_rows):
+def _vocab_transfer_groups(source, target, source_rows):
     source_vocab = source.get_vocab()
     groups = defaultdict(list)
     unmatched = []
@@ -182,7 +182,7 @@ def _qwen_token_groups(source, target, source_rows):
 
 
 @torch.no_grad()
-def _transfer_qwen_vocab(weight, groups, vocab_size):
+def _transfer_vocab(weight, groups, vocab_size):
     mean = weight.mean(dim=0, dtype=torch.float32).to(weight.dtype)
     resized = mean.expand(vocab_size, -1).clone()
     for piece_count, rows in groups.items():
@@ -213,16 +213,20 @@ def load_pretrained_hf(
     entry = get_model_entry(architectures)
     model_config_kwargs = map_hf_config(hf_config, entry["config_mapper"])
     if gemma_tokenizer_path is not None:
-        if entry["config_mapper"] != "qwen3_5":
-            raise ValueError("Qwen-ma requires a Qwen3.5 checkpoint")
+        ma_architecture = {
+            "qwen3_5": QWEN_MA_ARCHITECTURE,
+            "ling3": LING_MA_ARCHITECTURE,
+        }[entry["config_mapper"]]
         source_tokenizer = get_tokenizer(pretrained_dir, architectures).tokenizer
-        architectures = [QWEN_MA_ARCHITECTURE]
+        architectures = [ma_architecture]
         entry = get_model_entry(architectures)
         tokenizer = get_tokenizer(gemma_tokenizer_path, architectures)
         if tokenizer.get_bos_token_id() is None or None in tokenizer.get_eos_token_ids():
-            raise ValueError("Qwen-ma requires a Gemma 4 tokenizer with <bos> and <eos>")
+            raise ValueError(f"{ma_architecture} requires a Gemma 4 tokenizer with <bos> and <eos>")
         vocab_size = max(tokenizer.tokenizer.get_vocab().values()) + 1
         model_config_kwargs.update(architectures=architectures, vocab_size=vocab_size)
+        if ma_architecture == LING_MA_ARCHITECTURE:
+            model_config_kwargs["pad_token_id"] = tokenizer.get_pad_token_id()
     model_config_kwargs = _set_runtime_moe_backend(
         model_config_kwargs, architectures, device, kwargs.get("moe_backend")
     )
@@ -247,13 +251,13 @@ def load_pretrained_hf(
     if gemma_tokenizer_path is not None:
         embedding = state_dict[embedding_key]
         head = embedding if tied_source_head else state_dict["lm_head.weight"]
-        groups = _qwen_token_groups(
+        groups = _vocab_transfer_groups(
             source_tokenizer, tokenizer.tokenizer, min(embedding.size(0), head.size(0))
         )
-        state_dict[embedding_key] = _transfer_qwen_vocab(embedding, groups, vocab_size)
+        state_dict[embedding_key] = _transfer_vocab(embedding, groups, vocab_size)
         state_dict["lm_head.weight"] = (
             state_dict[embedding_key].clone() if tied_source_head
-            else _transfer_qwen_vocab(head, groups, vocab_size)
+            else _transfer_vocab(head, groups, vocab_size)
         )
     elif tied_source_head:
         state_dict["lm_head.weight"] = state_dict[embedding_key].clone()

@@ -4,7 +4,8 @@ import argparse
 import json
 import math
 import subprocess
-from collections import deque
+from collections import defaultdict, deque
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from time import perf_counter
@@ -140,6 +141,37 @@ def gpu_utilization(device):
     return None
 
 
+@contextmanager
+def measure_phase(timings, name, device, *, wall_clock=False):
+    if timings is None:
+        yield
+    elif device.type == "cuda" and not wall_clock:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        yield
+        end.record()
+        timings[name].append((start, end))
+    else:
+        if device.type == "mps":
+            torch.mps.synchronize()
+        start = perf_counter()
+        yield
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elif device.type == "mps":
+            torch.mps.synchronize()
+        timings[name].append(perf_counter() - start)
+
+
+def phase_seconds(timings):
+    return {
+        name: sum(start.elapsed_time(end) for start, end in samples) / 1000
+        if isinstance(samples[0], tuple) else sum(samples)
+        for name, samples in timings.items()
+    }
+
+
 def train(args, ddp, rank, world_size, device):
     from datasets import load_dataset
 
@@ -193,6 +225,8 @@ def train(args, ddp, rank, world_size, device):
         run_config = {key: value for key, value in vars(args).items() if not key.endswith("model_kwargs")}
         wandb_run = wandb.init(project="nanollm-opd", name=args.run, config=run_config)
 
+    print0(f"Student native ({type(student).__name__}, nanoVLLM rollout) | "
+           f"teacher {args.teacher_hf_backend} ({type(teacher).__name__})", flush=True)
     print0(f"{num_steps} OPD steps | {args.rollout_prompts * args.num_samples} completions per step", flush=True)
     engine = LLMEngine(student, tokenizer, engine_config)
     log_cuda = rank == 0 and device.type == "cuda"
@@ -201,20 +235,22 @@ def train(args, ddp, rank, world_size, device):
     recent_step_times = deque(maxlen=20)
     for step in range(1, num_steps + 1):
         step_started = perf_counter()
-        start = ((step - 1) % rounds_per_epoch) * args.rollout_prompts + rank * prompts_per_rank
-        prompt_texts = dataset[start:start + prompts_per_rank]["prompt"]
-        prompts = [render_prompt(tokenizer, prompt, args.prompt_format, max_seq_len) for prompt in prompt_texts]
-        # Synchronous inference uses the current weights. Free KV state before backpropagation.
-        with torch.no_grad():
-            outputs = engine.generate(
-                prompts,
-                sampling=SamplingParams(
-                    max_tokens=args.max_new_tokens, num_samples=args.num_samples,
-                    seed=args.seed + ((step - 1) * world_size + rank) * prompts_per_rank * args.num_samples,
-                ),
-                output=OutputSpec(logprobs=True),
-            )
-        engine.release_cache()
+        timings = defaultdict(list) if rank == 0 else None
+        with measure_phase(timings, "rollout", device, wall_clock=True):
+            start = ((step - 1) % rounds_per_epoch) * args.rollout_prompts + rank * prompts_per_rank
+            prompt_texts = dataset[start:start + prompts_per_rank]["prompt"]
+            prompts = [render_prompt(tokenizer, prompt, args.prompt_format, max_seq_len) for prompt in prompt_texts]
+            # Synchronous inference uses the current weights. Free KV state before backpropagation.
+            with torch.no_grad():
+                outputs = engine.generate(
+                    prompts,
+                    sampling=SamplingParams(
+                        max_tokens=args.max_new_tokens, num_samples=args.num_samples,
+                        seed=args.seed + ((step - 1) * world_size + rank) * prompts_per_rank * args.num_samples,
+                    ),
+                    output=OutputSpec(logprobs=True),
+                )
+            engine.release_cache()
 
         token_count = torch.tensor(sum(len(out.output_token_ids) for out in outputs), device=device)
         if ddp:
@@ -227,7 +263,7 @@ def train(args, ddp, rank, world_size, device):
                 student_flops += estimate_flops(*inputs.shape)
             mask = targets >= 0
             sampled = sampled[mask]
-            with torch.no_grad():
+            with measure_phase(timings, "teacher", device), torch.no_grad():
                 if args.teacher_hf_backend == "transformers":
                     logits = teacher(input_ids=inputs, use_cache=False).logits
                 else:
@@ -235,12 +271,14 @@ def train(args, ddp, rank, world_size, device):
                 advantages = completion_logprobs(logits, targets, mask) - sampled
                 del logits
 
-            current = completion_logprobs(student(inputs), targets, mask)
-            # Prepare for asynchronous training, not useful if synchronous training.
-            losses, ratios = importance_sampling(current, sampled, advantages)
-            loss_sum = losses.sum()
-            # Gradient averaging across ranks gives a global completion-token mean.
-            (loss_sum * world_size / token_count).backward()
+            with measure_phase(timings, "student_forward", device):
+                current = completion_logprobs(student(inputs), targets, mask)
+                # Prepare for asynchronous training, not useful if synchronous training.
+                losses, ratios = importance_sampling(current, sampled, advantages)
+                loss_sum = losses.sum()
+            with measure_phase(timings, "student_backward", device):
+                # Gradient averaging across ranks gives a global completion-token mean.
+                (loss_sum * world_size / token_count).backward()
             totals += torch.stack((loss_sum.detach(), -advantages.sum(), ratios.detach().sum()))
 
         if ddp:
@@ -248,21 +286,26 @@ def train(args, ddp, rank, world_size, device):
                 if parameter.grad is not None:
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
             dist.all_reduce(totals)
-        grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0, error_if_nonfinite=True)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        with measure_phase(timings, "optimizer", device):
+            grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0, error_if_nonfinite=True)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         if rank == 0:
             loss, reverse_kl, ratio = (totals / token_count).tolist()
             logs = dict(step=step, loss=loss, teacher_kl=reverse_kl, importance_ratio=ratio,
                         completion_tokens=token_count.item(), grad_norm=grad_norm.item())
             step_seconds = perf_counter() - step_started
+            # The scalar copies above wait for all timed work on the CUDA stream.
+            phases = phase_seconds(timings)
+            phase_text = ", ".join(f"{name.replace('_', ' ')} {seconds:.3f}s" for name, seconds in phases.items())
             recent_step_times.append(step_seconds)
             eta_seconds = (num_steps - step) * (sum(recent_step_times) / len(recent_step_times))
             eta = timedelta(seconds=math.ceil(eta_seconds))
             tok_per_sec = logs["completion_tokens"] / step_seconds
             logs.update({"timing/step_s": step_seconds, "timing/eta_s": eta_seconds,
                          "train/completion_tok_per_sec": tok_per_sec})
+            logs.update({f"timing/{name}_s": seconds for name, seconds in phases.items()})
             gpu_text = ""
             if log_cuda:
                 current_gib = torch.cuda.memory_allocated(device) / 1024**3
@@ -282,7 +325,7 @@ def train(args, ddp, rank, world_size, device):
             print0(f"Step {step}/{num_steps} | loss {loss:.6f} | sampled reverse KL {reverse_kl:.6f} "
                    f"| mean ratio {ratio:.6f} | grad norm {logs['grad_norm']:.6f} "
                    f"| tokens {logs['completion_tokens']} | {step_seconds:.2f}s | {tok_per_sec:.1f} tok/s"
-                   f"{gpu_text} | ETA {eta}", flush=True)
+                   f" | {phase_text}{gpu_text} | ETA {eta}", flush=True)
             wandb_run.log(logs)
         if rank == 0 and args.save_every and (step % args.save_every == 0 or step == num_steps):
             checkpoint_dir = Path(get_base_dir()) / "chatopd_checkpoints" / args.save_tag

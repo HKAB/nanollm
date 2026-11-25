@@ -32,6 +32,17 @@ except ImportError:
     _fla_causal_conv1d = None
     HAS_FLA_CONV = False
 
+try:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+
+    HAS_LIGER_KERNEL = True
+    LIGER_KERNEL_IMPORT_ERROR = None
+except Exception as exc:
+    LigerFusedLinearCrossEntropyLoss = None
+    HAS_LIGER_KERNEL = False
+    LIGER_KERNEL_IMPORT_ERROR = exc
+
+
 @dataclass
 class Qwen3_5ModelConfig:
     vocab_size: int = 248320
@@ -645,9 +656,42 @@ class Qwen3_5Model(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self.use_gradient_checkpointing = False
         self.logit_softcap = 0.0  # set via model.logit_softcap = N after load
+        self.linear_cross_entropy_backend = "torch"
+        self.liger_linear_cross_entropy = None
 
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
+
+    def set_linear_cross_entropy_backend(self, backend, softcap=0.0):
+        """Configure the optional fused training loss without changing inference."""
+        if backend not in {"auto", "torch", "liger"}:
+            raise ValueError("linear cross entropy backend must be auto, torch, or liger")
+        if backend == "auto":
+            backend = (
+                "liger"
+                if HAS_LIGER_KERNEL and self.get_device().type == "cuda"
+                else "torch"
+            )
+        if backend == "liger" and not HAS_LIGER_KERNEL:
+            raise ImportError(
+                "Liger Kernel is required for --linear-cross-entropy-backend=liger. "
+                "Install it with `pip install liger-kernel`."
+            ) from LIGER_KERNEL_IMPORT_ERROR
+
+        self.linear_cross_entropy_backend = backend
+        self.logit_softcap = softcap
+        self.liger_linear_cross_entropy = None
+        if backend == "liger":
+            softcap = softcap if softcap > 0 else None
+            self.liger_linear_cross_entropy = nn.ModuleDict({
+                reduction: LigerFusedLinearCrossEntropyLoss(
+                    ignore_index=-1,
+                    reduction=reduction,
+                    softcap=softcap,
+                )
+                for reduction in ("mean", "sum", "none")
+            })
+        print0(f"Qwen linear cross entropy backend: {backend}")
 
     @torch.no_grad()
     def prepare_for_checkpoint_load(self):
@@ -938,6 +982,19 @@ class Qwen3_5Model(nn.Module):
                     raise ValueError("logit_positions must have shape (batch_size,)")
                 batch_indices = torch.arange(B, device=x.device)
                 x = x[batch_indices, logit_positions].unsqueeze(1)
+        if targets is not None and self.linear_cross_entropy_backend == "liger":
+            if loss_reduction not in self.liger_linear_cross_entropy:
+                raise ValueError("loss_reduction must be mean, sum, or none")
+            hidden_2d = x.reshape(-1, x.shape[-1])
+            # The fused loss calls F.linear directly, whereas our ordinary
+            # Linear wrapper converts its weight to the activation dtype.
+            head_weight = self.lm_head.weight.to(dtype=hidden_2d.dtype)
+            return self.liger_linear_cross_entropy[loss_reduction](
+                head_weight,
+                hidden_2d,
+                targets.reshape(-1),
+            )
+
         hidden_states = x
         logits = self.project_logits(hidden_states)
         

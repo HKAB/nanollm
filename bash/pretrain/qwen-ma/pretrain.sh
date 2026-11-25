@@ -40,6 +40,7 @@ exec torchrun \
     --warmdown-ratio 0.1 \
     --warmup-steps 2000 \
     --optimizer muon \
+    --linear-cross-entropy-backend liger \
     --weight-decay 0.1 \
     --final-lr-frac 0.1 \
     --eval-every 10 \

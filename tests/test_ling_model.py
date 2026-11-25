@@ -1,14 +1,26 @@
+import json
 import re
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import WhitespaceSplit
 
 import nanollm.flash_attention as flash_attention
 import nanollm.models.ling as ling_module
+from nanollm.checkpoint_manager import build_model, load_pretrained_hf, save_checkpoint
 from nanollm.models.ling import Ling3Model, Ling3ModelConfig
-from nanollm.models.registry import get_model_entry, map_hf_config, map_hf_state_dict
+from nanollm.models.registry import (
+    LING_MA_ARCHITECTURE,
+    get_model_entry,
+    map_hf_config,
+    map_hf_state_dict,
+)
+from nanollm.tokenizers.gemma4_tokenizer import Gemma4Tokenizer
 from nanollm.tokenizers.ling_tokenizer import LingTokenizer
 from nanovllm import EngineConfig, LLMEngine, OutputSpec, SamplingParams
 
@@ -91,6 +103,93 @@ def test_ling_registry_and_official_config_mapping():
     assert mapped["emb_dim"] == 1536
     assert mapped["qk_head_dim"] == 192
     assert mapped["num_experts"] == 128
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+def test_ling_ma_vocab_transfer_and_checkpoint_round_trip(tmp_path, tie_word_embeddings):
+    source_dir = tmp_path / "ling"
+    target_dir = tmp_path / "gemma"
+    source_dir.mkdir()
+    target_dir.mkdir()
+    hf_config = {
+        "architectures": ["BailingMoeV3ForCausalLM"],
+        "vocab_size": 8,
+        "max_position_embeddings": 16,
+        "hidden_size": 32,
+        "num_attention_heads": 2,
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "head_dim": 16,
+        "num_key_value_heads": 2,
+        "layer_group_size": 1,
+        "q_lora_rank": 8,
+        "kv_lora_rank": 8,
+        "qk_head_dim": 16,
+        "qk_nope_head_dim": 8,
+        "qk_rope_head_dim": 8,
+        "v_head_dim": 16,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 16,
+        "moe_shared_expert_intermediate_size": 16,
+        "n_group": 2,
+        "topk_group": 1,
+        "pad_token_id": 7,
+        "tie_word_embeddings": tie_word_embeddings,
+    }
+    (source_dir / "config.json").write_text(json.dumps(hf_config))
+    for directory, tokens in (
+        (source_dir, ["<unk>", "cat", "dog"]),
+        (target_dir, ["<pad>", "<bos>", "<eos>", "<unk>", "dog", "cat dog"]),
+    ):
+        raw = Tokenizer(WordLevel({tok: i for i, tok in enumerate(tokens)}, unk_token="<unk>"))
+        raw.pre_tokenizer = WhitespaceSplit()
+        raw.save(str(directory / "tokenizer.json"))
+
+    source_model = Ling3Model(Ling3ModelConfig(**map_hf_config(hf_config, "ling3")))
+    source_model.init_weights()
+    source_state = source_model.state_dict()
+    embedding = source_state["transformer.wte.weight"]
+    head = source_state["lm_head.weight"]
+    hf_state = {}
+    for key, weight in source_state.items():
+        if key == "lm_head.weight" and tie_word_embeddings:
+            continue
+        key = key.replace("transformer.wte.", "model.word_embeddings.")
+        key = key.replace("final_norm.", "model.norm.")
+        key = key.replace("transformer.h.", "model.layers.")
+        hf_state[key] = weight
+    save_file(hf_state, source_dir / "model.safetensors")
+
+    device = torch.device("cpu")
+    model, tokenizer, meta = load_pretrained_hf(
+        source_dir, device, gemma_tokenizer_path=target_dir, moe_backend="auto",
+    )
+    assert isinstance(tokenizer, Gemma4Tokenizer)
+    assert model.config.architectures == [LING_MA_ARCHITECTURE]
+    assert model.config.moe_backend == "torch"
+    assert model.transformer.wte.padding_idx == 0
+    assert model.config.vocab_size == 6
+    torch.testing.assert_close(model.final_norm.weight, source_model.final_norm.weight)
+    for resized, original in (
+        (model.transformer.wte.weight, embedding),
+        (model.lm_head.weight, embedding if tie_word_embeddings else head),
+    ):
+        torch.testing.assert_close(resized[4], original[2])
+        torch.testing.assert_close(resized[5], original[1:3].mean(dim=0, dtype=torch.float32).to(original.dtype))
+        torch.testing.assert_close(resized[1], original.mean(dim=0, dtype=torch.float32).to(original.dtype))
+
+    idx = torch.tensor([[tokenizer.get_bos_token_id(), 4, 5]])
+    with torch.no_grad():
+        logits = model(idx)
+    assert logits.shape == (1, 3, 6)
+    assert logits.isfinite().all()
+    checkpoint_dir = tmp_path / "checkpoint"
+    save_checkpoint(checkpoint_dir, 0, model.state_dict(), None, meta, tokenizer)
+    restored, restored_tokenizer, _ = build_model(checkpoint_dir, 0, device, "eval")
+    assert isinstance(restored_tokenizer, Gemma4Tokenizer)
+    with torch.no_grad():
+        torch.testing.assert_close(restored(idx).float(), logits.float())
 
 
 def test_ling_tokenizer_special_tokens_and_tool_parser():
